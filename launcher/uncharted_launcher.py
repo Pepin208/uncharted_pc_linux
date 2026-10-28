@@ -550,6 +550,50 @@ def game_resolution(s, screen=None):
     return '' if (width, height) == (1920, 1080) else f'{width}x{height}'
 
 
+# Render-target memory the games need per extra 1080p worth of pixels (measured upstream,
+# docs/resolution.md), and the GPU pool headroom before its 32-bit size overflows 4 GiB.
+RT_MIB_PER_1080P = 300
+RT2_MIB_PER_1080P = 150
+POOL_HEADROOM_MIB = 1000
+
+
+def grow_game_memory(env, resolution):
+    """Match run.py's game_res(): BB_GAME_RES says the games render larger, but their fixed
+    render-target heaps, movie buffers and direct memory have to grow with the pixel count too.
+    Without this 2560x1440 exhausts the 497 MiB Render Target Heap at startup."""
+    value = (resolution or '').lower().replace('×', 'x')
+    try:
+        width, height = (int(part) for part in value.split('x'))
+    except (TypeError, ValueError):
+        env.pop('BB_GAME_RES', None)
+        return
+    if not (640 <= width <= 7680 and 360 <= height <= 4320) or (width, height) == (1920, 1080):
+        env.pop('BB_GAME_RES', None)
+        return
+    env['BB_GAME_RES'] = f'{width}x{height}'
+    scale = max(0.0, width * height / (1920 * 1080) - 1)
+
+    def grow(name, per_pixel_mib):
+        if not env.get(name, '').lstrip('-').isdigit():
+            # The game wants its heaps in multiples of 2 MiB; choose multiples of 64 MiB.
+            env[name] = str(-(-int(scale * per_pixel_mib) // 64) * 64)
+        return int(env[name])
+
+    rt, rt2 = grow('BB_GAME_RT_MB', RT_MIB_PER_1080P), grow('BB_GAME_RT2_MB', RT2_MIB_PER_1080P)
+    if not env.get('BB_GAME_FREE_MB', '').isdigit():
+        env['BB_GAME_FREE_MB'] = '0'  # the game's later 144 MiB allocation needs the remainder
+    if not env.get('BB_GAME_MOVIE_MB', '').isdigit():
+        frame_bytes = (-(-width // 16) * 16) * (-(-height // 64) * 64) * 3 // 2 + 65536
+        env['BB_GAME_MOVIE_MB'] = str(max(4, -(-frame_bytes // (2 << 20)) * 2))
+    pool = rt + rt2 - int(env['BB_GAME_FREE_MB'])
+    if not env.get('BB_DMEM_MB') and pool > 0:
+        env['BB_DMEM_MB'] = str(min(16384, 5056 + pool))
+    print(f"Game resolution {width}x{height}: render target heaps +{rt} +{rt2} MiB, unreserved GPU "
+          f"memory -{env['BB_GAME_FREE_MB']} MiB, direct memory {env.get('BB_DMEM_MB', 5056)} MiB"
+          + ('; above what the game can address (4 GiB GPU pool)' if pool > POOL_HEADROOM_MIB else ''),
+          flush=True)
+
+
 def game_environment(s, start=None):
     env = dict(os.environ)
     env['BB_INPUT_CONFIG'] = str(write_input_ini(s))
@@ -580,8 +624,7 @@ def game_environment(s, start=None):
     if str(s.get('speakers') or 'auto') != 'auto':
         env['BB_SPEAKERS'] = str(s['speakers'])
     resolution = game_resolution(s, screen_size())
-    if resolution:
-        env['BB_GAME_RES'] = resolution
+    grow_game_memory(env, resolution)
     window = parse_size(s.get('window_size'))
     if not s.get('fullscreen') and resolution and window and s.get('aspect', '16:9') != '16:9':
         shape = parse_size(resolution)
