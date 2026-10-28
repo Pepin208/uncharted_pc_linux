@@ -50,6 +50,22 @@ controls, and the new display mode, which is available on both systems).
 - Docs: `README.md` is now the Linux guide (AppImage + source); the upstream Windows guide is
   `README-upstream.md`; the build recipe is `docs/APPIMAGE.md`.
 
+## Release v0.3.9-linux (2026-10-28)
+
+- GitHub release on the fork: `Pepin208/uncharted_pc_linux`, tag `v0.3.9-linux`, target `main`
+  (`82680ef`): https://github.com/Pepin208/uncharted_pc_linux/releases/tag/v0.3.9-linux
+- Asset: `Uncharted_PC_Linux_Port-0.3.9-x86_64.AppImage`, 102 MB, zstd level 15 / 128K blocks.
+  SHA-256 `3274c11c13bf094a8e964ca3fd2d15f79ff78f9cd137612de67b8e27bcc770c6`; the
+  `.sha256` asset is attached too.
+- The release title and notes are in English (public repository). The AppImage, the launcher and
+  the README were tested with U1/U2/U3, PipeWire audio, first-run `DATA/` and the read-only
+  fallback; see the release notes.
+- `README.md` now links the release; `README-upstream.md` keeps the Windows guide;
+  `docs/APPIMAGE.md` is the public build recipe.
+- Every AppImage-related file lives outside the repository in `../Appimage/` (rootfs, cache,
+  build tree, dist, logs). `Appimage/README.md` is the detailed handoff/build guide for a future
+  session or LLM.
+
 ## Linux build and runtime
 
 | File | Change |
