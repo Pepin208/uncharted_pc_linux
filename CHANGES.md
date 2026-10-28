@@ -57,6 +57,13 @@ and logs every run under `logs/`.
   touchpad=Tab, D-pad=arrows, left stick=WASD, mouse look on with sensitivity 3.0.
 * Window icon comes from the box art through PIL on Linux (Tk cannot read the `.ico` there), and
   the brand wordmark is measured so it fits the sidebar with whatever face the system has.
+* `run_uncharted_gui.sh` starts the launcher with the runner's environment: one `BB_GAME_DIR`,
+  `BB_DATA_DIR`, `bbport.ini`, `input.ini`, `user/` and `logs/`. The launcher passes `BB_DATA_DIR`,
+  `BB_CONFIG`, `BB_LOG_DIR` and `BB_RESTART_SCRIPT` to `run_uncharted.sh`, so a custom data
+  directory is shared by both routes.
+* Linux layout fixes: page subtitles and row hints wrap to the card width (long texts were clipped
+  with the wider fallback font), folder rows shrink the entry around the Browse/Open buttons, and
+  the interface-language option says `Automatic (Linux)` instead of Windows.
 
 ## In-game menu (`gpu/shim`, Dear ImGui)
 

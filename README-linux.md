@@ -150,12 +150,20 @@ BB_LTO=OFF BB_PGO=off bash build.sh
 
 ```sh
 BB_EXE=u1 bash run_uncharted.sh     # u1 = Drake's Fortune (default), u2, u3
-python3 launcher/uncharted_launcher.py
+bash run_uncharted_gui.sh           # the launcher (Tk), same folders and settings
+bash run_uncharted_gui.sh --play    # start the saved game without the window
 ```
 
 `run_uncharted.sh` is the Linux counterpart of the Windows `run.py`: it prepares the guest image
 for the chosen game, starts `bb-probe` and follows the collection menu when it asks for another
 executable. Every run is logged in `logs/` (`logs/latest.log` is the newest).
+
+`run_uncharted_gui.sh` starts the launcher with the same environment as the runner: the same
+`BB_GAME_DIR`, `BB_DATA_DIR`, `bbport.ini`, `input.ini`, `user/` and `logs/`. The launcher's Play
+button calls `run_uncharted.sh` with the settings from its own pages, so both routes use one set
+of files. Settings live in `<data>/settings.json` (portable: they travel with the folder), the
+controls in `<data>/input.ini`, and the game's in-game options in `<data>/bbport.ini`; `BB_DATA_DIR`
+and `BB_CONFIG` change the location for both.
 
 The launcher opens the game folder, the saves folder, the display options, the controls and the
 log. Its settings live in `<port>/settings.json` (portable: they travel with the folder) and the

@@ -27,7 +27,9 @@ def language_code(value=''):
 
 TRANSLATIONS = {
     'es': {
-        'Automatic (Windows)': 'Automático (Windows)', 'Play': 'Jugar', 'Stop': 'Detener',
+        'Automatic (Windows)': 'Automático (Windows)', 'Automatic (Linux)': 'Automático (Linux)', 'Play': 'Jugar', 'Stop': 'Detener',
+        'Native port: the original PS4 game code runs directly on {}.':
+        'Port nativo: el código original del juego de PS4 se ejecuta directamente en {}.',
         'Game': 'Juego', 'Display': 'Pantalla', 'Controls': 'Controles', 'Advanced': 'Avanzado',
         'Log': 'Registro', 'Library': 'Biblioteca', 'Double-click a cover to launch':
         'Haz doble clic en una portada para iniciar', 'Game folder': 'Carpeta del juego',
@@ -142,7 +144,9 @@ TRANSLATIONS = {
         'by {}': 'por {}', 'see the Log page': 'consulta la página Registro',
     },
     'pt': {
-        'Automatic (Windows)': 'Automático (Windows)', 'Play': 'Jogar', 'Stop': 'Parar',
+        'Automatic (Windows)': 'Automático (Windows)', 'Automatic (Linux)': 'Automático (Linux)', 'Play': 'Jogar', 'Stop': 'Parar',
+        'Native port: the original PS4 game code runs directly on {}.':
+        'Port nativo: o código original do jogo de PS4 roda diretamente em {}.',
         'Game': 'Jogo', 'Display': 'Tela', 'Controls': 'Controles', 'Advanced': 'Avançado',
         'Log': 'Registro', 'Library': 'Biblioteca', 'Double-click a cover to launch':
         'Clique duas vezes em uma capa para iniciar', 'Game folder': 'Pasta do jogo',
@@ -256,7 +260,9 @@ TRANSLATIONS = {
         'by {}': 'por {}', 'see the Log page': 'consulte a página Registro',
     },
     'fr': {
-        'Automatic (Windows)': 'Automatique (Windows)', 'Play': 'Jouer', 'Stop': 'Arrêter',
+        'Automatic (Windows)': 'Automatique (Windows)', 'Automatic (Linux)': 'Automatique (Linux)', 'Play': 'Jouer', 'Stop': 'Arrêter',
+        'Native port: the original PS4 game code runs directly on {}.':
+        'Port natif : le code original du jeu PS4 s’exécute directement sous {}.',
         'Game': 'Jeu', 'Display': 'Affichage', 'Controls': 'Commandes', 'Advanced': 'Avancé',
         'Log': 'Journal', 'Library': 'Bibliothèque', 'Double-click a cover to launch':
         'Double-cliquez sur une jaquette pour lancer', 'Game folder': 'Dossier du jeu',

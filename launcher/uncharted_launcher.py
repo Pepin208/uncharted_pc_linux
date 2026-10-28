@@ -553,6 +553,13 @@ def game_resolution(s, screen=None):
 def game_environment(s, start=None):
     env = dict(os.environ)
     env['BB_INPUT_CONFIG'] = str(write_input_ini(s))
+    # The launcher and the runner share one data directory: settings.json, bbport.ini,
+    # input.ini, the saves and the runner's logs live under the same folder even when
+    # BB_DATA_DIR or BB_CONFIG point somewhere else.
+    env.setdefault('BB_DATA_DIR', str(DATA_DIR))
+    env.setdefault('BB_CONFIG', str(ini_path()))
+    env.setdefault('BB_LOG_DIR', str(DATA_DIR / 'logs'))
+    env.setdefault('BB_RESTART_SCRIPT', str(RUNNER))
     start = start or s['start']
     # The collection folder; with none, the folder of the game started. A game with a folder of its own
     # (Game page) is taken from it, also when another game of the collection starts it.
@@ -843,15 +850,25 @@ class Launcher:
                           self.font_play if kind == 'primary' and icon else self.font_button, kind,
                           background, padding, icon, self.font_icon_sm)
 
-    def row(self, parent, title, widget, hint=None):
+    def row(self, parent, title, widget, hint=None, expand=False):
         parent = self.target(parent)
         r = self.next_row(parent)
         self.ttk.Label(parent, text=title).grid(row=r, column=0, sticky='nw', padx=(0, 24), pady=(9, 0))
-        widget.grid(row=r, column=1, sticky='w', pady=(5, 0), in_=parent)
+        widget.grid(row=r, column=1, sticky='ew' if expand else 'w', pady=(5, 0), in_=parent)
         widget.lift()
         if hint:
-            self.ttk.Label(parent, text=hint, style='Muted.TLabel', wraplength=self.px(560), justify='left').grid(
-                row=r + 1, column=1, sticky='w', pady=(3, 4))
+            hint_label = self.ttk.Label(parent, text=hint, style='Muted.TLabel',
+                                        wraplength=self.px(560), justify='left')
+            # Full row under the title and the control: with the hint only under the control,
+            # pages with long titles (Fixes) had ~120 px for it and the text ran past the card.
+            hint_label.grid(row=r + 1, column=0, columnspan=2, sticky='w', pady=(3, 4))
+
+            def fit_hint(_event=None, label=hint_label, parent=parent):
+                width = parent.winfo_width() - self.px(8)
+                if width >= self.px(200) and int(float(label.cget('wraplength') or 0)) != width:
+                    label.configure(wraplength=width)
+            parent.bind('<Configure>', fit_hint, add='+')
+            self.root.after_idle(fit_hint)
         return widget
 
     def check(self, parent, key, title, hint=None):
@@ -882,21 +899,26 @@ class Launcher:
     def folder(self, parent, key, title, prompt, hint=None, on_change=None):
         var = self.var(key)
         holder = self.tk.Frame(self.target(parent), bg=CARD)
-        self.ttk.Entry(holder, textvariable=var, width=54).pack(side='left')
+        # Buttons first so the entry takes the room that is left: with the entry's fixed width the
+        # Spanish "Examinar…/Abrir" buttons ran past the card on Linux, where the font is wider.
+        self.pill(holder, _('Open'), lambda: self.open_path(var.get(), key), kind='ghost',
+                  padding=(12, 6)).pack(side='right', padx=(4, 0))
+        self.pill(holder, _('Browse…'), self.browse_folder(var, prompt, key), padding=(14, 6)).pack(
+            side='right', padx=(8, 0))
+        self.ttk.Entry(holder, textvariable=var, width=1).pack(side='left', fill='x', expand=True)
 
+        if on_change:
+            var.trace_add('write', lambda *_a: on_change())
+        return self.row(parent, title, holder, hint, expand=True)
+
+    def browse_folder(self, var, prompt, key):
+        """Picks a folder; the initial directory is never the read-only AppImage mount."""
         def browse():
-            # Never open at the read-only AppImage mount (PORT_DIR): the sibling game folder for
-            # the game field, the data folder for the rest.
             start = var.get() or (sibling_game_dir() if key == 'game_dir' else '') or str(DATA_DIR)
             chosen = self.filedialog.askdirectory(title=prompt, initialdir=start)
             if chosen:
                 var.set(str(Path(chosen)))
-        self.pill(holder, _('Browse…'), browse, padding=(14, 6)).pack(side='left', padx=(8, 0))
-        self.pill(holder, _('Open'), lambda: self.open_path(var.get(), key), kind='ghost',
-                  padding=(12, 6)).pack(side='left', padx=(4, 0))
-        if on_change:
-            var.trace_add('write', lambda *_a: on_change())
-        return self.row(parent, title, holder, hint)
+        return browse
 
     def image_path(self, title, current=''):
         """Choose and validate a local image."""
@@ -1036,8 +1058,14 @@ class Launcher:
         shell.pack(fill='both', expand=True, padx=self.px(18), pady=(self.px(14), 0))
         head = tk.Frame(shell, bg=SURFACE)
         head.pack(fill='x', padx=self.px(26), pady=(self.px(18), self.px(14)))
-        tk.Label(head, text=title, bg=SURFACE, fg=TEXT, font=self.font_title).pack(anchor='w')
-        tk.Label(head, text=subtitle, bg=SURFACE, fg=MUTED, font=self.font_ui).pack(anchor='w', pady=(2, 0))
+        tk.Label(head, text=title, bg=SURFACE, fg=TEXT, font=self.font_title, anchor='w').pack(anchor='w')
+        subtitle_label = tk.Label(head, text=subtitle, bg=SURFACE, fg=MUTED, font=self.font_ui,
+                                  anchor='w', justify='left')
+        subtitle_label.pack(anchor='w', pady=(2, 0), fill='x')
+        # Tk labels do not wrap on their own: without this a long subtitle is centred and clipped
+        # on both sides (the first characters disappear on Linux where the fallback font is wider).
+        head.bind('<Configure>', lambda event, label=subtitle_label: label.configure(
+            wraplength=max(self.px(240), event.width - self.px(4))), add='+')
         # The page body scrolls when it is taller than the window (Display holds many options).
         body = tk.Frame(shell, bg=SURFACE)
         body.pack(fill='both', expand=True)
@@ -1879,8 +1907,10 @@ class Launcher:
                    _('Starts each game as part of the collection, so the Sony, Naughty Dog and Bluepoint '
                      'logos are skipped and it goes straight to the menu. Applies when the game starts.'))
         self.section(f, _('Launcher language'), top=2)
+        languages = [(code, label.replace('(Windows)', f'({WORD})'))
+                     for code, label in uncharted_i18n.LANGUAGES]
         self.row(f, _('Interface language'),
-                 self.choice(f, 'ui_language', uncharted_i18n.LANGUAGES, 24, self.change_ui_language),
+                 self.choice(f, 'ui_language', languages, 24, self.change_ui_language),
                  _('This changes only the launcher. The game language is selected on the Game page.'))
         self.check(f, 'close_on_play', _('Close the launcher when the game starts'))
         extra = self.ttk.Entry(f, textvariable=self.var('extra_env'), width=60)
