@@ -64,6 +64,8 @@ and logs every run under `logs/`.
 * Linux layout fixes: page subtitles and row hints wrap to the card width (long texts were clipped
   with the wider fallback font), folder rows shrink the entry around the Browse/Open buttons, and
   the interface-language option says `Automatic (Linux)` instead of Windows.
+* Credits: the sidebar shows `by SuperMedo` and `Linux fork by Pepin208`; the Advanced page has an
+  About section with the original PC port author, the Linux fork author and the version.
 * Resolutions above 1080p get the memory run.py gives them: the launcher now sets
   `BB_GAME_RT_MB`, `BB_GAME_RT2_MB`, `BB_GAME_FREE_MB`, `BB_GAME_MOVIE_MB` and `BB_DMEM_MB` from
   the render size (2560x1440: +256/+128 MiB of render-target heaps, +384 MiB of GPU pool,

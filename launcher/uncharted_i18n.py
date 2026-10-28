@@ -68,6 +68,9 @@ TRANSLATIONS = {
         'Native port: the original PS4 game code runs directly on Windows.':
         'Port nativo: el código original de PS4 se ejecuta directamente en Windows.',
         'version': 'versión', 'version {}': 'versión {}',
+        'About': 'Acerca de', 'Linux fork by {}': 'Fork Linux por {}',
+        'Original PC port by {}': 'Port original para PC por {}',
+        'Launcher, runner and AppImage packaging.': 'Launcher, runner y empaquetado AppImage.',
         '\n— the game exited (code {}) —\n': '\n— el juego terminó (código {}) —\n',
         'AMD RCAS after FSR 1 (only while the image is enlarged).':
         'AMD RCAS después de FSR 1 (solo cuando se amplía la imagen).',
@@ -184,6 +187,9 @@ TRANSLATIONS = {
         'Native port: the original PS4 game code runs directly on Windows.':
         'Port nativo: o código original do jogo de PS4 é executado diretamente no Windows.',
         'version': 'versão', 'version {}': 'versão {}',
+        'About': 'Sobre', 'Linux fork by {}': 'Fork Linux por {}',
+        'Original PC port by {}': 'Port original para PC por {}',
+        'Launcher, runner and AppImage packaging.': 'Launcher, runner e empacotamento AppImage.',
         '\n— the game exited (code {}) —\n': '\n— o jogo terminou (código {}) —\n',
         'AMD RCAS after FSR 1 (only while the image is enlarged).':
         'AMD RCAS após o FSR 1 (somente quando a imagem é ampliada).',
@@ -300,6 +306,9 @@ TRANSLATIONS = {
         'Native port: the original PS4 game code runs directly on Windows.':
         'Portage natif : le code original du jeu PS4 s’exécute directement sous Windows.',
         'version': 'version', 'version {}': 'version {}',
+        'About': 'À propos', 'Linux fork by {}': 'Portage Linux par {}',
+        'Original PC port by {}': 'Portage PC original par {}',
+        'Launcher, runner and AppImage packaging.': 'Lanceur, runner et paquet AppImage.',
         '\n— the game exited (code {}) —\n': '\n— le jeu s’est terminé (code {}) —\n',
         'AMD RCAS after FSR 1 (only while the image is enlarged).':
         "AMD RCAS après FSR 1 (uniquement lorsque l’image est agrandie).",

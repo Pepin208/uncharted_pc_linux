@@ -48,6 +48,7 @@ CONFIG_FILE = CONFIG_DIR / 'settings.json'
 NAME = 'Uncharted'
 WORD = 'Windows' if IS_WINDOWS else 'Linux'
 AUTHOR = 'SuperMedo'
+FORK_AUTHOR = 'Pepin208'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
 VERSION = '0.3.9'
 RELEASES_API = 'https://api.github.com/repos/Supermedo/uncharted_pc/releases/latest'
@@ -1176,6 +1177,9 @@ class Launcher:
             anchor='w', padx=18, pady=(1, 0))
         tk.Label(side, text=_('by {}').format(AUTHOR), bg=BG, fg=TEXT, font=self.font_ui_md,
                  anchor='w', wraplength=brand_wrap, justify='left').pack(anchor='w', padx=18, pady=(10, 0))
+        tk.Label(side, text=_('Linux fork by {}').format(FORK_AUTHOR), bg=BG, fg=GOLD_DIM,
+                 font=self.font_ui_sm, anchor='w', wraplength=brand_wrap, justify='left').pack(
+            anchor='w', padx=18, pady=(2, 0))
         tk.Label(side, text=_('version {}').format(VERSION), bg=BG, fg='#5c564c', font=self.font_ui_sm,
                  anchor='w').pack(anchor='w', padx=18, pady=(1, 0))
         tk.Frame(side, bg=LINE, height=1).pack(fill='x', padx=18, pady=(16, 14))
@@ -1978,6 +1982,11 @@ class Launcher:
                       ).pack(side='left')
             self.pill(holder, _('Releases page'), lambda: webbrowser.open(RELEASES_PAGE)).pack(
                 side='left', padx=(8, 0))
+        self.section(f, _('About'))
+        self.note(f, _('Original PC port by {}').format(AUTHOR), top=2)
+        self.note(f, _('Linux fork by {}').format(FORK_AUTHOR), top=2)
+        self.note(f, _('Launcher, runner and AppImage packaging.'), top=2)
+        self.note(f, _('version {}').format(VERSION), top=2)
 
     def build_log(self):
         tk = self.tk
