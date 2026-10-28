@@ -711,7 +711,8 @@ class Launcher:
         self.load_fonts()
         self.style()
         self.build()
-        self.show('play')
+        # A first start with no game folder opens the Game page, not Play with an error.
+        self.show('play' if game_available(self.app, self.app['start']) else 'game')
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.drain_output)
         root.after(150, self.detect_controller)

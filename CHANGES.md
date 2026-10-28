@@ -21,6 +21,35 @@ three games on Linux, plus the launcher and in-game menu work. Upstream v0.3.9 w
 Nothing here changes the Windows behaviour except where it is stated (portable settings, default
 controls, and the new display mode, which is available on both systems).
 
+## Portable AppImage
+
+- Built in an **Ubuntu 24.04 rootfs** with `bwrap` (`packaging/appimage/build-ubuntu.sh`), not with
+  the host's libraries. Everything AppImage-related lives in `../Appimage/` (`rootfs/`, `cache/`,
+  `build/`, `dist/`, `logs/`); the repository's `out/` is not used.
+- **SDL3 3.4.18 with ALSA/PulseAudio/PipeWire** (`packaging/appimage/build-sdl3.sh`): the SDL3
+  used by the first AppImage attempts had no audio backend and the game fell back to
+  `Runtime: audio backend timer (silent)`. The AppImage now reports the host's backend (e.g.
+  `pipewire`) and plays sound.
+- **Minimal FFmpeg** (`packaging/appimage/build-ffmpeg-min.sh`): MP4/MOV/MKV, H.264/HEVC/AAC/MP3/
+  PCM and file/pipe input. Ubuntu's full libavformat links the desktop (GTK, X11, GnuTLS,
+  libxml2), and bundling that closure breaks the host's glib/xcb; leaving it out breaks on other
+  distributions' SONAMEs. Only the minimal build is bundled.
+- **Libraries** are copied with `packaging/appimage/bundle-libs.sh` except glibc, the dynamic
+  loader, X11/xcb/Wayland/fontconfig/freetype, GL/Vulkan/DRM, the GPU drivers, glib/GIO and the
+  audio/udev backends, which stay the host's.
+- `packaging/appimage/AppRun` creates **`DATA/` next to the AppImage** (uppercase, fallback
+  `~/.local/share/uncharted/DATA`), sets `LD_LIBRARY_PATH` and `BB_DATA_DIR`, and finds the game
+  in `DATA/game/CUSA*`, next to the AppImage or in `game/CUSA*`. `BB_APPIMAGE_SELFTEST=1` prints
+  the paths and checks for missing libraries.
+- The squashfs is **zstd level 15, 128K blocks**; `APPIMAGE_ZSTD_LEVEL` and `APPIMAGE_BLOCK`
+  override it. The AppImage is not compressed a second time.
+- Output: `Appimage/dist/Uncharted_PC_Linux_Port-0.3.9-x86_64.AppImage` and `.sha256` (about
+  100–110 MB with the current launcher and libraries).
+- The launcher opens the **Game** page on a first run without a dump, instead of Play with an
+  error.
+- Docs: `README.md` is now the Linux guide (AppImage + source); the upstream Windows guide is
+  `README-upstream.md`; the build recipe is `docs/APPIMAGE.md`.
+
 ## Linux build and runtime
 
 | File | Change |
@@ -94,10 +123,9 @@ python3 launcher/uncharted_launcher.py       # or: BB_EXE=u2 bash run_uncharted.
 
 ## Documentation
 
-`README-linux.md` is the guide for this fork: what works, the packages for Debian/Ubuntu, Fedora and
-Arch, the build and run steps, the controls, the in-game menu, the environment variables and
-troubleshooting. The upstream Windows README is `README.md`; `README.md` keeps the upstream guide
-and links here.
+`README.md` is the guide for this fork: what works, the AppImage and its `DATA/` folder, the packages
+for Debian/Ubuntu, Fedora and Arch, the build and run steps, the controls, the in-game menu, the
+environment variables and troubleshooting. The upstream Windows guide is `README-upstream.md`.
 
 ## Verified
 

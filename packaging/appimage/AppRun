@@ -1,29 +1,37 @@
 #!/bin/bash
-# AppRun for the Uncharted bbport AppImage (Linux).
+# AppRun for the Uncharted Linux AppImage.
 #
-# Portable layout: the user keeps the game, this .AppImage and the program's data inside one
-# folder X. The data goes next to the .AppImage (not ~/.local/share), so moving X keeps saves,
-# bbport.ini, settings.json, shader cache and logs together.
+# Portable layout: keep the game, this .AppImage and the DATA folder together. The data goes next
+# to the .AppImage (not ~/.local/share) when that folder is writable, so moving the folder keeps
+# saves, bbport.ini, settings.json, shader caches and logs together. A read-only location falls
+# back to ~/.local/share/uncharted/DATA.
 set -euo pipefail
 
 # Steam preloads its overlay (LD_PRELOAD) into every non-Steam game; it and the host's other
 # injection variables are host libraries that must not leak into this package's environment.
-unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GTK_PATH GTK_MODULES GIO_EXTRA_MODULES \
+unset LD_PRELOAD LD_AUDIT GTK_PATH GTK_MODULES GIO_EXTRA_MODULES \
       GDK_PIXBUF_MODULEDIR PYTHONHOME PYTHONPATH 2>/dev/null || true
 
 # $APPIMAGE is the absolute path of this file (set by the type-2 runtime, also when it runs
 # extracted). $APPDIR is the temporary mount point: never store data there. Running AppRun
-# straight from an AppDir (packaging tests) leaves $APPDIR unset: fall back to its own folder.
+# straight from an AppDir (packaging tests) leaves $APPIMAGE unset: fall back to its own folder.
 self=$(readlink -f "${APPIMAGE:-$0}")
 selfdir=$(dirname -- "$self")
 appdir=${APPDIR:-$(cd -- "$(dirname -- "$self")" && pwd)}
+
+# The bundled libraries (SDL3, FFmpeg, protobuf, fmt, zydis, X11/Wayland...). glibc, the Vulkan
+# ICD and the graphics drivers stay the host's, by design.
+export LD_LIBRARY_PATH="$appdir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# One data folder for both the launcher and run_uncharted.sh. Uppercase DATA is what the README
+# documents; it is created on the first start.
 if [ -w "$selfdir" ]; then
-    BB_DATA_DIR="$selfdir/data"
+    BB_DATA_DIR="$selfdir/DATA"
 else
-    BB_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/uncharted"
+    BB_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/uncharted/DATA"
 fi
 export BB_DATA_DIR
-mkdir -p -- "$BB_DATA_DIR"
+mkdir -p -- "$BB_DATA_DIR" "$BB_DATA_DIR/game"
 
 # The frozen launcher (PyInstaller: Python + Tkinter + Pillow) lives next to run_uncharted.sh.
 # run_uncharted.sh runs this port's scripts through its --script role, so no system Python is
@@ -31,16 +39,22 @@ mkdir -p -- "$BB_DATA_DIR"
 PORT="$appdir/usr/share/uncharted"
 export BB_LAUNCHER="$PORT/Uncharted"
 
-# The game folder: a sibling of this .AppImage holding eboot.bin (e.g. X/CUSA02320), unless the
-# caller already set BB_GAME_DIR.
+# The game folder: DATA/game/CUSAxxxx, a sibling of this .AppImage (X/CUSA02320) or X/game/CUSAxxxx,
+# unless the caller already set BB_GAME_DIR. Both the EU (CUSA02320) and US (CUSA08034) dumps work.
 if [ -z "${BB_GAME_DIR:-}" ]; then
-    for d in "$selfdir"/*/; do
-        if [ -f "$d/eboot.bin" ]; then BB_GAME_DIR="${d%/}"; break; fi
+    for base in "$BB_DATA_DIR/game" "$selfdir" "$selfdir/game"; do
+        [ -d "$base" ] || continue
+        for d in "$base"/CUSA*/; do
+            if [ -f "${d}eboot.bin" ]; then
+                BB_GAME_DIR="${d%/}"
+                break 2
+            fi
+        done
     done
 fi
 [ -n "${BB_GAME_DIR:-}" ] && export BB_GAME_DIR
 
-# Diagnostic: verify the portable paths without opening a window.
+# Diagnostic: verify the portable paths and the bundled libraries without opening a window.
 if [ "${BB_APPIMAGE_SELFTEST:-0}" = 1 ]; then
     echo "APPIMAGE=$self"
     echo "APPDIR=$appdir"
@@ -48,6 +62,11 @@ if [ "${BB_APPIMAGE_SELFTEST:-0}" = 1 ]; then
     echo "BB_DATA_DIR=$BB_DATA_DIR"
     echo "BB_GAME_DIR=${BB_GAME_DIR:-<none>}"
     echo "BB_LAUNCHER=$BB_LAUNCHER"
+    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+    echo "--- missing libraries (bb-probe) ---"
+    if command -v ldd >/dev/null; then
+        ldd "$PORT/out/bb-probe" 2>&1 | grep 'not found' || echo "none"
+    fi
     exit 0
 fi
 
