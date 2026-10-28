@@ -13,6 +13,9 @@ AppImage. The upstream Windows guide is [README-upstream.md](README-upstream.md)
 
 ## AppImage (recommended)
 
+**[Download the latest AppImage](https://github.com/Pepin208/uncharted_pc_linux/releases/latest)** ·
+[All releases](https://github.com/Pepin208/uncharted_pc_linux/releases)
+
 The AppImage bundles the port and its libraries; nothing has to be installed apart from a Vulkan
 driver.
 
