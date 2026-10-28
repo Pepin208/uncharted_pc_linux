@@ -5,11 +5,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <source_location>
 #include <span>
 #include <utility>
 #include <vector>
@@ -618,6 +620,11 @@ public:
         return storage + offset;
     }
 
+    /// Storage for data too large for the chunk, freed with the chunk's commands.
+    void* AllocateOverflow(size_t bytes) {
+        return overflow.emplace_back(std::make_unique_for_overwrite<std::byte[]>(bytes)).get();
+    }
+
     void Execute(vk::CommandBuffer cmdbuf) {
         for (CommandBase* command = first; command;) {
             CommandBase* const next = command->next;
@@ -627,6 +634,7 @@ public:
         }
         first = last = nullptr;
         used = 0;
+        overflow.clear();
     }
 
     [[nodiscard]] bool Empty() const noexcept {
@@ -665,6 +673,7 @@ private:
 
     alignas(64) std::byte storage[Capacity];
     size_t used = 0;
+    std::vector<std::unique_ptr<std::byte[]>> overflow;
     CommandBase* first{};
     CommandBase* last{};
 };
@@ -771,8 +780,7 @@ public:
             return;
         }
         if (bytes + 1024 > RecordChunk::Capacity) {
-            BeginDirectRecording(__builtin_return_address(0));
-            return;
+            bytes = 0; // RecordData puts it in the chunk's overflow storage; keep room for the command
         }
         if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
             full_chunks.push_back(std::move(record_chunk));
@@ -783,18 +791,29 @@ public:
     /// Copies `data` into recording storage that lives until the command that uses it has
     /// been recorded (the same chunk). With threaded recording off, returns `data` itself.
     template <typename T>
-    std::span<const T> RecordData(std::span<const T> data) {
+    std::span<const T> RecordData(std::span<const T> data,
+                                  std::source_location where = std::source_location::current()) {
         if (!IsRecordingDeferred() || data.empty()) {
             return data;
         }
         // Room for the data and the command that follows it, so both stay in one chunk.
         const size_t bytes = data.size_bytes();
         ReserveRecordData(bytes + alignof(T));
-        if (!IsRecordingDeferred()) {
-            // The payload does not fit in a chunk: keep the caller's data, used at once.
-            return data;
+        void* storage = nullptr;
+        if (RecordChunk::Capacity - record_chunk->Size() >= bytes + alignof(T) + 1024) {
+            storage = record_chunk->Allocate(bytes, alignof(T));
         }
-        auto* dst = static_cast<T*>(record_chunk->Allocate(bytes, alignof(T)));
+        if (!storage) {
+            // More than a chunk holds (thousands of copy regions or barriers): heap storage owned
+            // by the same chunk, so it lives until the command has been recorded.
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "Recording: %zu bytes of command data from %s:%u, over a chunk\n",
+                             bytes, where.file_name(), unsigned(where.line()));
+            }
+            storage = record_chunk->AllocateOverflow(bytes);
+        }
+        auto* dst = static_cast<T*>(storage);
         std::memcpy(dst, data.data(), bytes);
         return {dst, data.size()};
     }
@@ -826,7 +845,9 @@ public:
     /// bbport: runs `signal` once the guest memory copies issued so far are done, without
     /// waiting here: the recording thread reaches it after the copies queued before it and hands
     /// it to the copy threads' completion (BbCopy::AfterCopies).
-    void SignalAfterHostCopies(std::function<void()> signal);
+    /// `landing_seq`: the deferred raycaster copies up to it (landing_gate.h) land before the
+    /// signal runs.
+    void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0);
 
     /// bbport: before a guest-visible write that is not deferred (WriteData, end-of-shader
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that

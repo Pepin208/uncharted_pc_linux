@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstring>
 #include <map>
+#include <mutex>
 #include "core/libraries/videoout/driver.h"
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
@@ -234,6 +239,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     scene_targets = std::make_unique<SceneTargets>(instance, scheduler, runtime, texture_cache);
     // Object motion first: it fixes the buffer addresses the motion shader variants embed.
     object_motion = std::make_unique<ObjectMotion>(instance, scheduler);
+    // bbport: from here the stored pipelines load on background threads (the motion shaders
+    // among them need the buffer addresses fixed just above).
+    pipeline_cache.StartWarmUp();
     camera_motion = std::make_unique<CameraMotion>(instance, scheduler, texture_cache, runtime);
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
@@ -461,13 +469,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         // is depth-only (U1's prepass) or draws RGBA16F color (U2's first scene pass) holds the
         // scene depth.
         const auto& depth = texture_cache.GetImage(db_desc.first);
+        // The game's render size: 1920x1080, or BB_GAME_RES (src/runtime_display.c).
+        static const auto game_size = [] {
+            unsigned w = 1920, h = 1080;
+            if (const char* res = std::getenv("BB_GAME_RES")) {
+                unsigned pw = 0, ph = 0;
+                if (std::sscanf(res, "%ux%u", &pw, &ph) == 2 && pw >= 640 && ph >= 360) {
+                    w = pw & ~1u;
+                    h = ph & ~1u;
+                }
+            }
+            return std::pair<u32, u32>{w, h};
+        }();
+        const u32 game_w = game_size.first, game_h = game_size.second;
         bool scene_pass = !cb_descs[0].first;
         if (cb_descs[0].first) {
             const auto& color = texture_cache.GetImage(cb_descs[0].first);
             scene_pass = color.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
-                         color.info.size.width == 1920 && color.info.size.height == 1080;
+                         color.info.size.width == game_w && color.info.size.height == game_h;
         }
-        if (scene_pass && depth.info.size.width == 1920 && depth.info.size.height == 1080 &&
+        if (scene_pass && depth.info.size.width == game_w && depth.info.size.height == game_h &&
             (depth.info.pixel_format == vk::Format::eD32SfloatS8Uint ||
              depth.info.pixel_format == vk::Format::eD32Sfloat)) {
             camera_motion->OnGBufferPass(db_desc.first);
@@ -1312,9 +1333,140 @@ static u32 ForceUploadVs(bool index) {
     return (setting.second & (index ? 1 : 2)) ? setting.first : 0;
 }
 
+// bbport diagnosis: BB_SHADER_DEBUG_FILE=<file>, re-read every 250 ms while the game runs, so a
+// visual problem can be bisected without restarting: "skip <hash>,..." works like
+// BB_SKIP_SHADERS, "trace <hash>" like BB_TRACE_SHADER (the next 8 draws after each change).
+namespace {
+struct LiveShaderDebug {
+    static constexpr u32 MaxSkipped = 256;
+    std::array<std::atomic<u64>, MaxSkipped> skipped{};
+    std::atomic<u32> num_skipped{0};
+    std::atomic<u64> trace{0};
+    std::atomic<u32> trace_generation{0};
+    // "jitter <hash>,...": full-screen passes of these pixel shaders get the upscaler's jitter.
+    static constexpr u32 MaxJittered = 16;
+    std::array<std::atomic<u64>, MaxJittered> jittered{};
+    std::atomic<u32> num_jittered{0};
+    std::atomic<s64> next_read_ns{0};
+    std::mutex read_mutex;
+};
+
+const char* LiveShaderDebugFile() {
+    static const char* path = std::getenv("BB_SHADER_DEBUG_FILE");
+    return path;
+}
+
+LiveShaderDebug& LiveDebug() {
+    static LiveShaderDebug state;
+    const char* path = LiveShaderDebugFile();
+    const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (!path || now < state.next_read_ns.load(std::memory_order_relaxed) ||
+        !state.read_mutex.try_lock()) {
+        return state;
+    }
+    std::scoped_lock lk{std::adopt_lock, state.read_mutex};
+    state.next_read_ns.store(now + 250'000'000, std::memory_order_relaxed);
+    std::vector<u64> skip, jitter;
+    u64 trace = 0;
+    if (FILE* f = std::fopen(path, "r")) {
+        char line[4096];
+        while (std::fgets(line, sizeof(line), f)) {
+            const bool is_skip = std::strncmp(line, "skip ", 5) == 0;
+            const bool is_jitter = std::strncmp(line, "jitter ", 7) == 0;
+            if (!is_skip && !is_jitter && std::strncmp(line, "trace ", 6) != 0) {
+                continue;
+            }
+            for (const char* p = line + (is_skip ? 5 : is_jitter ? 7 : 6); *p;) {
+                char* end;
+                const u64 value = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                if (is_skip) {
+                    skip.push_back(value);
+                } else if (is_jitter) {
+                    jitter.push_back(value);
+                } else {
+                    trace = value;
+                }
+                p = *end == ',' ? end + 1 : end;
+            }
+        }
+        std::fclose(f);
+    }
+    const u32 count = std::min<u32>(u32(skip.size()), LiveShaderDebug::MaxSkipped);
+    state.num_skipped.store(0, std::memory_order_release);
+    for (u32 i = 0; i < count; ++i) {
+        state.skipped[i].store(skip[i], std::memory_order_relaxed);
+    }
+    state.num_skipped.store(count, std::memory_order_release);
+    const u32 jitter_count = std::min<u32>(u32(jitter.size()), LiveShaderDebug::MaxJittered);
+    if (jitter_count != state.num_jittered.load(std::memory_order_relaxed)) {
+        std::printf("Shader debug: jittering %u full-screen shaders\n", jitter_count);
+    }
+    state.num_jittered.store(0, std::memory_order_release);
+    for (u32 i = 0; i < jitter_count; ++i) {
+        state.jittered[i].store(jitter[i], std::memory_order_relaxed);
+    }
+    state.num_jittered.store(jitter_count, std::memory_order_release);
+    if (state.trace.exchange(trace, std::memory_order_relaxed) != trace) {
+        state.trace_generation.fetch_add(1, std::memory_order_relaxed);
+        std::printf("Shader debug: skipping %u shaders, tracing %08x\n", count, u32(trace));
+    }
+    return state;
+}
+} // namespace
+
+// bbport: BB_JITTER_PS=<pixel shader hash>,... (run.py, Uncharted): full-screen passes that
+// rebuild positions from the scene depth through an interpolated texture coordinate, jittered
+// like the scene geometry. Unjittered, they reconstructed each pixel from depth that was
+// rendered half a pixel away: the sun shadow pass (f614041e) moved against the geometry with
+// every jitter step and flickered under FSR and TAA, worst on the largest steps (every 4th
+// frame). The live "jitter" line of BB_SHADER_DEBUG_FILE adds shaders for tests.
+static bool JitterFullScreenPass(u64 hash) {
+    static const std::vector<u64> listed = [] {
+        std::vector<u64> list;
+        if (const char* env = std::getenv("BB_JITTER_PS")) {
+            for (const char* p = env; *p;) {
+                char* end;
+                const u64 value = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                list.push_back(u64(u32(value)));
+                p = *end == ',' ? end + 1 : end;
+            }
+        }
+        return list;
+    }();
+    if (std::find(listed.begin(), listed.end(), u64(u32(hash))) != listed.end()) {
+        return true;
+    }
+    if (!LiveShaderDebugFile()) {
+        return false;
+    }
+    auto& live = LiveDebug();
+    const u32 count = live.num_jittered.load(std::memory_order_acquire);
+    for (u32 i = 0; i < count; ++i) {
+        if (u32(live.jittered[i].load(std::memory_order_relaxed)) == u32(hash)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // bbport: BB_SKIP_SHADERS=<hash>,...: draws and dispatches of these pixel/compute shaders
 // are not recorded (diagnostic: which pass of a frame causes a visual problem).
 static bool SkipShader(u64 hash) {
+    if (hash && LiveShaderDebugFile()) {
+        auto& live = LiveDebug();
+        const u32 count = live.num_skipped.load(std::memory_order_acquire);
+        for (u32 i = 0; i < count; ++i) {
+            if (u32(live.skipped[i].load(std::memory_order_relaxed)) == u32(hash)) {
+                return true;
+            }
+        }
+    }
     static const std::vector<u64> skipped = [] {
         std::vector<u64> list;
         if (const char* env = std::getenv("BB_SKIP_SHADERS")) {
@@ -1348,9 +1500,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     const auto& regs = Regs();
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
-    // target is that frame.
+    // target is that frame. Uncharted draws twice into the same display buffer per frame
+    // (484cdbf5, then 749bbec9): only the first starts a frame. The second start reset the
+    // upscaler's history every frame (DLSS/FSR/TAA showed the raw jittered scene: shimmer on
+    // every edge) and skipped every other jitter phase. Toggle 1 << 59 brings it back.
     if (camera_motion->Enabled() && regs.color_buffers[0] &&
-        FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+        FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address()) &&
+        (scene_started || regs.color_buffers[0].Address() != frame_display_address ||
+         BbToggle::Disabled(BbToggle::OneFrameStart))) {
+        frame_display_address = regs.color_buffers[0].Address();
         scene_started = false;
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
@@ -1624,6 +1782,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
         draw_jitter = upscaler->Jitter();
+    } else if (const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+               ps && upscaler->Enabled() && JitterFullScreenPass(ps->pgm_hash)) {
+        draw_jitter = upscaler->Jitter();
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
@@ -1831,6 +1992,44 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     scheduler.KickRecording();
 }
 
+void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
+    static const bool enabled = [] {
+        // Off by default: in U3's Cartagena square it halved the frame rate (94 -> 46 FPS).
+        const char* env = std::getenv("BB_READBACK_SMALL_BUFFERS");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    for (const auto& desc : stage.buffers) {
+        if (desc.IsSpecial() || !desc.is_written) {
+            continue;
+        }
+        const auto sharp = desc.GetSharp(stage);
+        const u32 size = sharp.GetSize();
+        if (!sharp.base_address || size == 0 || size > 64) {
+            continue;
+        }
+        std::scoped_lock lk{small_written_mutex};
+        const std::pair<VAddr, u32> range{sharp.base_address, size};
+        if (small_written_buffers.size() < 16 &&
+            std::ranges::find(small_written_buffers, range) == small_written_buffers.end()) {
+            small_written_buffers.push_back(range);
+        }
+    }
+}
+
+void Rasterizer::ReadBackSmallWrittenBuffers() {
+    std::vector<std::pair<VAddr, u32>> ranges;
+    {
+        std::scoped_lock lk{small_written_mutex};
+        ranges.swap(small_written_buffers);
+    }
+    for (const auto& [address, size] : ranges) {
+        buffer_cache.ReadMemory(address, size, false, true);
+    }
+}
+
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
     BbStats::dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -1917,6 +2116,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (!BindResources(pipeline)) {
         return;
     }
+    NoteSmallWrittenBuffers(cs);
     if (StaleCheckEnabled()) {
         VAddr slot = ~VAddr{0};
         u64 slot_size = 0;
@@ -2162,6 +2362,7 @@ void Rasterizer::OnSubmit() {
         buffer_cache.ProcessFaultBuffer();
     }
     texture_cache.ProcessDownloadImages();
+    texture_cache.UpdateButtonPrompts();
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
 }
@@ -2193,8 +2394,17 @@ bool Rasterizer::BindHelperWanted() {
     return false;
 }
 
+bool Rasterizer::DrawsToDisplayForIcons() const {
+    if (!FrameCapture::CollectingIcons()) {
+        return false;
+    }
+    const auto& regs = Regs();
+    return regs.color_buffers[0] && FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address());
+}
+
 bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {
     if (pipeline->IsCompute() || !bind_helper.Available() || FrameCapture::Active() ||
+        DrawsToDisplayForIcons() ||
         BbToggle::Disabled(BbToggle::TextureBindHelper) ||
         BbToggle::Disabled(BbToggle::TextureBindingMemo) ||
         BbToggle::Disabled(BbToggle::UpdateImageFastPath)) {
@@ -2880,6 +3090,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     memory->IsValidGpuMapping(ring->address, 0)) {
                     camera_motion->OnConstants(reinterpret_cast<const float*>(ring->address));
                 }
+                // Frame captures: constants copied into the ring (most per-pass constants).
+                if (FrameCapture::Active() && ring->size <= 1024) {
+                    FrameCapture::Buffer(stage.pgm_hash, binding.buffer, ring->address,
+                                         constant_ring->Data(ring->offset), ring->size);
+                }
                 push_data.AddOffset(binding.buffer, 0);
             }
             buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
@@ -3064,10 +3279,19 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     const u32 first_image_idx = image_infos.size();
     // bbport diagnosis: BB_TRACE_SHADER=<hash> prints the T# of every texture binding of that
     // shader (first 8 draws).
-    static const u64 trace_hash = [] {
+    static const u64 env_trace_hash = [] {
         const char* env = std::getenv("BB_TRACE_SHADER");
         return env ? std::strtoull(env, nullptr, 16) : 0ull;
     }();
+    u64 trace_hash = env_trace_hash;
+    u32 trace_generation = 0;
+    if (LiveShaderDebugFile()) {
+        auto& live = LiveDebug();
+        if (const u64 live_hash = live.trace.load(std::memory_order_relaxed)) {
+            trace_hash = live_hash;
+            trace_generation = live.trace_generation.load(std::memory_order_relaxed);
+        }
+    }
     if (trace_hash && u32(stage.pgm_hash) == u32(trace_hash)) {
         // The frame with the draw is dumped too (BB_FRAME_DUMP_TRIGGER, at most every 300 ms).
         static auto last_dump = std::chrono::steady_clock::time_point{};
@@ -3080,7 +3304,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 std::fclose(f);
             }
         }
-        static std::atomic<u32> traced{0};
+        static std::atomic<u32> traced{0}, traced_generation{0};
+        if (traced_generation.exchange(trace_generation, std::memory_order_relaxed) !=
+            trace_generation) {
+            traced.store(0, std::memory_order_relaxed);
+        }
         if (traced.fetch_add(1, std::memory_order_relaxed) < 8) {
             for (u32 i = 0; i < stage.images.size(); ++i) {
                 const auto t = prepared ? prepared->image_sharps[i] : stage.images[i].GetSharp(stage);
@@ -3135,8 +3363,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             std::fflush(stdout);
         }
     }
+    // BB_ICON_COLLECT=1: the HUD and prompt pictures, drawn straight into a display buffer.
+    const bool collect_icons =
+        !on_helper && stage.sw_stage != Shader::SwStage::Compute && DrawsToDisplayForIcons();
     TextureSet* set_slot = nullptr;
-    if (!on_helper && BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
+    if (!on_helper && !collect_icons &&
+        BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
         // Descriptor writes: one per image (no mip arrays in a memoized set).
         for (u32 i = 0; i < stage.images.size(); ++i) {
             auto& set_write = set_writes[write_index++];
@@ -3317,6 +3549,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
+            if (FrameCapture::Active() && !is_storage) {
+                FrameCapture::DumpTexture(runtime, image);
+            }
+            if (collect_icons && !is_storage) {
+                FrameCapture::CollectIcon(runtime, image);
+            }
             const auto binding = image.binding;
 
             // bbport: a proxied scene image sampled with normalized coordinates reads the proxy:
@@ -4008,7 +4246,11 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             return;
         }
     }
-    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    if (!dst_gds) {
+        // bbport: the copy writes exactly this range; textures the game moves this way can sit
+        // anywhere in it (#38: blue/white textures until re-uploaded).
+        texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, true);
+    }
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {

@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <mutex>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
+#include "bbport_toggles.h"
 #include "common/arch.h"
 #include "common/decoder.h"
 #include "common/io_file.h"
@@ -28,11 +31,14 @@
 using namespace Xbyak::util;
 
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
+// bbport: shaders are translated on several threads; the walker code buffer is shared.
+static std::mutex g_srt_mutex;
 static const u8* g_srt_codegen_start = nullptr;
 
 namespace Shader {
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    std::scoped_lock lock{g_srt_mutex};
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
@@ -75,6 +81,20 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     const void* code = Common::GetRip(context);
     if (code < code_start || code >= code_end) {
         return false; // Not in SRT code range
+    }
+
+    // bbport: a draw-preparation worker walks the tables ahead of the GPU thread, through
+    // pointers the game may not have written yet or has already reused. Its faults are for the
+    // worker's recovery point; patching the walker here would zero that load for every later
+    // walk of the shader, including the GPU thread's, which then reads null resource tables.
+    if (runtime_fault_recover) {
+        static std::atomic<u32> speculative_faults{0};
+        if (speculative_faults.fetch_add(1, std::memory_order_relaxed) < 20) {
+            LOG_WARNING(Render_Recompiler,
+                        "SRT walker read faulted ahead of the GPU thread at {}, fault address {}: not patched",
+                        code, fault_address);
+        }
+        return false;
     }
 
     // Patch instruction to zero register
@@ -693,6 +713,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
 
 static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     Xbyak::CodeGenerator& c = g_srt_codegen;
+    std::scoped_lock srt_lock{g_srt_mutex};
 
     if (pass_info.srt_roots.empty()) {
         return;

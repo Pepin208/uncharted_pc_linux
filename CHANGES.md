@@ -1,7 +1,22 @@
 # Changes
 
-Work on top of `Supermedo/uncharted_pc` (`main`, commit 00e7129): the same port running the three
-games on Linux, plus the launcher and in-game menu work.
+Work on top of `Supermedo/uncharted_pc` (`main` at v0.3.9, `754ed2a`): the same port running the
+three games on Linux, plus the launcher and in-game menu work. Upstream v0.3.9 was merged on
+2026-10-28; its features and fixes (0.3.2..0.3.9) are kept and the Linux work is on top.
+
+## Upstream merge (0.3.2..0.3.9, 2026-10-28)
+
+- Taken from upstream: higher resolutions and ultrawide, background shader compilation with
+  per-GPU caches, the Fixes / Trophies / Cheats pages, button prompts, launcher languages, custom
+  covers, the 0.3.9 BilalReloaded fixes, the Linux build/runtime fixes (#72, #112, #223),
+  case-insensitive path lookup and host-buffer file reads.
+- Kept from this fork: the Linux runner and launcher platform layer, the display modes, the VMA
+  header, the thread-record low map, the texture-cache fixes for U1's blue textures, the intro
+  skip through each game's `gameconfig.txt`, and the AppImage packaging.
+- Dropped as already upstream: the 64-byte buffer shadow merge, the oversized-payload recording
+  path, the English menu translations and the case-insensitive symlink workaround.
+- Linux-only additions after the merge: `near_image_memory()` with `mmap` (game callbacks on
+  Linux), FFmpeg in `build.sh`, and the GCC 14 warning fixes.
 
 Nothing here changes the Windows behaviour except where it is stated (portable settings, default
 controls, and the new display mode, which is available on both systems).
@@ -65,9 +80,10 @@ python3 launcher/uncharted_launcher.py       # or: BB_EXE=u2 bash run_uncharted.
 
 ## Documentation
 
-`README.md` is the guide for this fork: what works, the packages for Debian/Ubuntu, Fedora and
+`README-linux.md` is the guide for this fork: what works, the packages for Debian/Ubuntu, Fedora and
 Arch, the build and run steps, the controls, the in-game menu, the environment variables and
-troubleshooting. The upstream Windows README is kept as `README-windows.md`.
+troubleshooting. The upstream Windows README is `README.md`; `README.md` keeps the upstream guide
+and links here.
 
 ## Verified
 

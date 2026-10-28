@@ -2,6 +2,13 @@
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
 project(bbgpu LANGUAGES C CXX)
+# Newer libc++ (clang 21+) no longer includes these transitively; the shadPS4, sirit and FFX
+# sources rely on them (std::abort, _countof, swprintf_s, log2, placement new, ...).
+if(WIN32)
+    foreach(header cstdlib cstring cstdio cstdint cmath cwchar new limits utility algorithm)
+        add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${header}>")
+    endforeach()
+endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -172,7 +179,11 @@ add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOU
 add_dependencies(bbgpu host_shaders)
 # bbport co-op: PS4 network and PSN libraries with the shadNet client, from shadp2p
 # (github.com/Wozzardman/shadp2p, GPL-2.0), for private Bloodborne co-op servers.
-find_package(Protobuf CONFIG REQUIRED)
+find_package(Protobuf CONFIG QUIET)
+if (NOT Protobuf_FOUND)
+    # distributions with protobuf 3.x (Debian) ship no CMake package.
+    find_package(Protobuf REQUIRED)
+endif()
 set(SHADNET_PROTO_OUT "${CMAKE_CURRENT_BINARY_DIR}/shadnet_proto_gen")
 file(MAKE_DIRECTORY "${SHADNET_PROTO_OUT}")
 add_custom_command(
@@ -200,16 +211,13 @@ if (WIN32)
     target_sources(bbnet PRIVATE third_party/wepoll/wepoll.c)
     target_include_directories(bbnet PRIVATE third_party/wepoll)
 endif()
-# UPnP (net_upnp.cpp) uses miniupnpc on every platform. MINIUPNP_STATICLIB is for the MinGW
-# static library only: it marks the API as a local static on Windows and has no effect when
-# the shared miniupnpc is linked on Linux.
-find_path(MINIUPNPC_INCLUDE miniupnpc.h PATH_SUFFIXES miniupnpc REQUIRED)
-find_library(MINIUPNPC_LIBRARY NAMES libminiupnpc.a miniupnpc REQUIRED)
-target_include_directories(bbnet PRIVATE "${MINIUPNPC_INCLUDE}")
-target_link_libraries(bbnet PRIVATE "${MINIUPNPC_LIBRARY}")
+    find_path(MINIUPNPC_INCLUDE miniupnpc.h PATH_SUFFIXES miniupnpc REQUIRED)
+    find_library(MINIUPNPC_LIBRARY NAMES libminiupnpc.a miniupnpc REQUIRED)
+    target_include_directories(bbnet PRIVATE "${MINIUPNPC_INCLUDE}")
 if (WIN32)
     target_compile_definitions(bbnet PRIVATE MINIUPNP_STATICLIB)
 endif()
+    target_link_libraries(bbnet PRIVATE "${MINIUPNPC_LIBRARY}")
 target_compile_definitions(bbnet PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbnet PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 target_link_libraries(bbnet PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
@@ -249,6 +257,8 @@ if (WIN32)
     target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
 else()
+    # the xbyak submodule, as on Windows (no system package needed).
+    target_include_directories(bbgpu PRIVATE third_party/xbyak)
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
 endif()
 # xbyak (third_party/xbyak, header-only) is used by the shader recompiler on every platform.
@@ -263,12 +273,12 @@ if (WIN32)
     add_library(atrac9 STATIC ${BB_ATRAC9})
     target_compile_options(atrac9 PRIVATE -w)
     set_target_properties(atrac9 PROPERTIES C_STANDARD 99 INTERPROCEDURAL_OPTIMIZATION OFF)
-    add_executable(bb-probe ../src/probe.c ${BB_RUNTIME} ../src/compat_win.c ../src/vulkan_smoke.c
+    add_executable(bb-probe ../src/probe.c ../src/red_zone.c ../src/cpu_patch.c ${BB_RUNTIME} ../src/compat_win.c ../src/vulkan_smoke.c
         ../packaging/windows/bb-probe.rc)
     set_target_properties(bb-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
     target_compile_options(bb-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror>)
     target_include_directories(bb-probe PRIVATE .. ../src)
-    target_link_libraries(bb-probe PRIVATE bbgpu atrac9 onecore bcrypt ws2_32 -pthread)
+    target_link_libraries(bb-probe PRIVATE bbgpu atrac9 Zydis::Zydis onecore bcrypt ws2_32 -pthread)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")

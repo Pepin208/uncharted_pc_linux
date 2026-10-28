@@ -6,13 +6,18 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <vector>
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
+#include <miniz.h>
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -174,7 +179,7 @@ void Menu() {
                                                std::min(160.0f * base_scale, max_h)),
                                         ImVec2(max_w, max_h));
     bool keep_open = true;
-    if (!ImGui::Begin("Uncharted Settings  (Insert / L3+R3)", &keep_open,
+    if (!ImGui::Begin("Uncharted — settings  (Insert / L3+R3)", &keep_open,
                       ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
@@ -201,14 +206,14 @@ void Menu() {
 
     ImGui::SeparatorText("Temporal upscaler");
     static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
-                                     "TAA (native anti-aliasing)", "DLSS (NVIDIA RTX)"};
-    static const char* later[] = {"XeSS"};
+                                     "TAA (native anti-aliasing)", "DLSS (NVIDIA RTX)", "XeSS (Intel)"};
     int upscaler = s.upscaler;
     if (ImGui::BeginCombo("Upscaler", upscalers[upscaler])) {
         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
             const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
                 : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
-                : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load() : true;
+                : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load()
+                : i == BbSettings::UpscalerXess   ? s.xess_supported.load() : true;
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
                 Store(s.upscaler, i, true);
@@ -219,17 +224,13 @@ void Menu() {
                 ImGui::TextDisabled("— not supported by this GPU");
             }
         }
-        for (const char* name : later) {
-            ImGui::BeginDisabled();
-            ImGui::Selectable(name, false);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled("— work in progress");
-        }
         ImGui::EndCombo();
     }
     if (const char* problem = s.dlss_problem.load(); problem && upscaler == BbSettings::UpscalerDlss) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "DLSS: %s", problem);
+    }
+    if (const char* problem = s.xess_problem.load(); problem && upscaler == BbSettings::UpscalerXess) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "XeSS: %s", problem);
     }
     if (const char* problem = s.fsr4_problem.load()) {
         ImGui::PushTextWrapPos();
@@ -241,17 +242,17 @@ void Menu() {
     if (BbSettings::IsFsr4(s.upscaler)) {
         if (s.upscaler == BbSettings::UpscalerFsr411) {
             Hint("FSR 4.1.1 in INT8 mode: the model from AMD's 4.1.1 DLL, reproduced in Vulkan "
-                 "(the result matches the DLL). One model for Native..Performance and a separate one "
-                 "for Ultra Performance. Assets: tools/fsr4cap/build_assets.sh (needs the DLL and Proton).");
+                 "(output matches the DLL). One model for Native..Performance and a separate one "
+                 "for Ultra Performance. Assets: tools/fsr4cap/build_assets.sh (needs the DLLs and Proton).");
         } else {
-            Hint("FSR 4 in INT8 mode (model v07 from the AMD FidelityFX SDK sources). Higher quality "
-                 "than FSR 3.1, but the pass is heavier. Changing the preset rebuilds the model (a short "
+            Hint("FSR 4 in INT8 mode (the v07 model from the AMD FidelityFX SDK sources). Higher quality "
+                 "than FSR 3.1, but a heavier pass. Changing the preset rebuilds the model (a short "
                  "pause). Assets: tools/fetch_fsr4_assets.sh.");
         }
         Checkbox("FSR 4: auto exposure", s.fsr4_auto_exposure);
         Checkbox("FSR 4: invert jitter sign", s.fsr4_invert_jitter);
-        Hint("Check while hosting: the FSR 4 network normalizes color by exposure and uses it to decide "
-             "when to discard past frames. Applied immediately, no restart.");
+        Hint("Checks for ghosting: the FSR 4 network normalizes color by exposure and uses it to decide "
+             "when to discard previous frames. Changes apply immediately, without a restart.");
     }
     const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
     const bool taa = s.upscaler == BbSettings::UpscalerTaa;
@@ -278,8 +279,8 @@ void Menu() {
     }
     ImGui::EndDisabled();
     if (taa) {
-        ImGui::TextWrapped("TAA antialiases the scene at the output resolution, without the FSR model or upscaling. "
-                           "The saved FSR preset is restored when FSR is selected again.");
+        ImGui::TextWrapped("TAA anti-aliases the scene at the output resolution, without an FSR model or upscaling. "
+                           "The saved FSR preset comes back when FSR is selected.");
     }
     ImGui::Text("Active scene render: %d x %d", s.active_render_width.load(),
                 s.active_render_height.load());
@@ -287,47 +288,47 @@ void Menu() {
         ImGui::Text("Preset at startup: %s", BbSettings::PresetName(s.startup_preset));
         if (const char* automatic = std::getenv("BB_AUTO_RENDER_RES");
             automatic && automatic[0] == '1') {
-            Hint("With a non-1080p output the whole game draws at the preset resolution (startup patch): "
-                 "this is fastest on the Steam Deck and weak GPUs. Changing the preset or the output "
-                 "resolution needs a restart. The «Live resolution change» item below enables it "
-                 "without a restart (post-processing then stays at 1080p, slower).");
+            Hint("With an output other than 1080p the whole game renders at the preset's size (a startup "
+                 "patch): fastest on the Steam Deck and weaker GPUs. Preset or output resolution "
+                 "changes need a restart. The \"Live resolution changes\" option below allows "
+                 "changes without a restart (post-processing then stays at 1080p, slower).");
         } else {
-            Hint("BB_RENDER_RES fixes the scene size at start. Remove that explicit variable "
-                 "to change resolution and presets without restarting the game.");
+            Hint("BB_RENDER_RES fixes the scene size at startup. Remove that variable to change "
+                 "resolution and presets without restarting the game.");
         }
     } else {
-        Hint("Native AA: FSR acts as antialiasing. The other presets lower the scene "
-             "render resolution relative to the output. The UI draws at the output resolution. "
-             "The preset applies from the next frame, with no restart.");
+        Hint("Native AA: FSR works as anti-aliasing. The other presets lower the scene's render "
+             "resolution relative to the output. The UI is drawn at the output resolution. "
+             "The preset applies from the next frame, without restarting the game.");
     }
     Checkbox("Sharpening (RCAS)", s.sharpen);
     ImGui::BeginDisabled(!s.sharpen);
-    Slider("Sharpness strength", s.sharpness, 0.0f, 2.0f);
+    Slider("Sharpening strength", s.sharpness, 0.0f, 2.0f);
     Hint("Up to 1: the upscaler's own sharpening (RCAS). Above 1 an extra RCAS pass is added. "
-         "Ctrl+click a slider to type an exact value.");
+         "Ctrl+click the slider to type an exact value.");
     ImGui::EndDisabled();
-    Checkbox("Subpixel jitter", s.jitter);
-    Hint("Each frame the scene shifts by a fraction of a pixel and the upscaler gathers more "
-         "detail from several frames. Without it only history-based antialiasing remains.");
+    Checkbox("Sub-pixel jitter", s.jitter);
+    Hint("Each frame the scene shifts by a fraction of a pixel, and the upscaler gathers more "
+         "detail from several frames. Without it you only get history-based smoothing.");
 
-    ImGui::SeparatorText("Reactivity mask");
+    ImGui::SeparatorText("Reactive mask");
     ImGui::BeginDisabled(taa);
-    Checkbox("Enable the mask", s.reactive);
-    Hint("Flags transparent effects (particles, haze) so the upscaler leans less on "
-         "past frames. Fewer trails behind effects, but shimmering returns underneath them.");
+    Checkbox("Enable mask", s.reactive);
+    Hint("Marks transparent effects (particles, haze) so the upscaler relies less on previous "
+         "frames. Fewer trails behind effects, but shimmer returns underneath them.");
     ImGui::BeginDisabled(!s.reactive);
     Slider("Scale", s.reactive_scale, 0.0f, 4.0f);
     Slider("Threshold", s.reactive_threshold, 0.0f, 1.0f);
     Slider("Maximum", s.reactive_max, 0.0f, 1.0f);
     bool show_mask = s.debug_view == BbSettings::DebugReactive;
-    if (ImGui::Checkbox("Show the mask (debug)", &show_mask)) {
+    if (ImGui::Checkbox("Show mask (debug)", &show_mask)) {
         s.debug_view = show_mask ? BbSettings::DebugReactive : BbSettings::DebugNone;
     }
     ImGui::EndDisabled();
     ImGui::EndDisabled();
     Checkbox("Character motion vectors", s.object_motion);
-    Hint("Exact vectors for animated objects: clothing and weapons break up less "
-         "while moving. A static scene gets no extra pass. "
+    Hint("Exact vectors for animated objects: clothing and weapons break up less in motion. "
+         "A static scene gets no extra pass. "
          "The change applies after restarting the game.");
     bool show_motion = s.debug_view == BbSettings::DebugMotion;
     if (ImGui::Checkbox("Show motion vectors (debug)", &show_motion)) {
@@ -335,8 +336,8 @@ void Menu() {
     }
     Hint("Red/green: horizontal/vertical motion (8 pixels = full brightness). "
          "Blue: the pixel got an exact object vector, not just camera motion. "
-         "A moving object with no blue and no red/green is taken as still "
-         "by the upscaler, hence the trail.");
+         "A moving object with neither blue nor red/green is treated by the upscaler "
+         "as still, which causes trails.");
     ImGui::EndDisabled(); // upscaler off
 
     ImGui::SeparatorText("Frame generation");
@@ -358,9 +359,9 @@ void Menu() {
         }
         ImGui::EndCombo();
     }
-    Hint("Frames inserted between two of the game's: 60 FPS on screen become 120. Needs the "
-         "Mailbox or Immediate present mode and a monitor at that rate. Adds a little input latency. "
-         "Menus and videos are not generated.");
+    Hint("Frames between two game frames: 60 FPS on screen becomes 120. Needs Mailbox or "
+         "Immediate presentation and a monitor with that refresh rate. Adds a little input "
+         "latency. Menus and videos are not generated.");
     const int max_multiplier = s.frame_gen == BbSettings::FrameGenDlss ? s.dlssg_max_multiplier.load() : 2;
     ImGui::BeginDisabled(s.frame_gen == BbSettings::FrameGenOff || max_multiplier <= 2);
     int multiplier = std::min(s.frame_gen_multiplier.load(), max_multiplier);
@@ -384,16 +385,16 @@ void Menu() {
         ImGui::EndCombo();
     }
     if (BbSettings::FixedRenderSession()) {
-        Hint("Size of the final frame and of the UI. The preset sets the scene size relative to the "
-             "output: 4K Performance = 1920x1080. Applies after restarting the game.");
+        Hint("Size of the finished frame and the UI. The preset sets the scene size relative to "
+             "the output: 4K Performance = 1920x1080. Applies after restarting the game.");
     } else {
-        Hint("Size of the final frame and of the UI changes at the next frame boundary. "
+        Hint("The size of the finished frame and UI changes at the next frame boundary. "
              "The preset sets the scene size relative to the output: 4K Performance = 1920x1080. "
-             "A size change resets the FSR history and may cause a short pause.");
+             "Changing it resets FSR's history and may cause a short pause.");
     }
     static const char* live_modes[] = {"Auto (by GPU)", "Off (faster)", "On"};
     int live = s.live_resolution + 1;
-    if (ImGui::BeginCombo("Live resolution change", live_modes[live])) {
+    if (ImGui::BeginCombo("Live resolution changes", live_modes[live])) {
         for (int i = 0; i < 3; ++i) {
             if (ImGui::Selectable(live_modes[i], i == live)) {
                 Store(s.live_resolution, i - 1, true);
@@ -402,52 +403,24 @@ void Menu() {
         ImGui::EndCombo();
     }
     Hint("On: output resolution and preset change without a restart, but the game's post-processing "
-         "stays at 1080p — noticeably slower on the Steam Deck and older GPUs. "
-         "Off: everything draws at the preset resolution, changes need a restart. Auto enables it "
-         "on strong discrete GPUs. Applies after restarting the game.");
-    ImGui::SeparatorText("Game effects (after a restart)");
-    static const char* lods[] = {"Highest (-2)", "As in the game", "Lower (1)", "Lowest (2)"};
-    static constexpr int lod_values[] = {-2, 0, 1, 2};
-    int lod_index = 1;
-    for (int i = 0; i < 4; ++i) {
-        if (lod_values[i] == s.model_lod) lod_index = i;
-    }
-    if (ImGui::BeginCombo("Model detail", lods[lod_index])) {
-        for (int i = 0; i < 4; ++i) {
-            if (ImGui::Selectable(lods[i], i == lod_index)) {
-                Store(s.model_lod, lod_values[i], true);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    for (int e = 0; e < BbSettings::EffectCount; ++e) {
-        Checkbox(BbSettings::Effects[e].label, s.effects[e]);
-    }
-    Hint("Effects are enabled and disabled by the game's patches at start (patches/Bloodborne.xml). "
-         "Motion blur and dynamic light shadows load the GPU noticeably. \"Skip intro movies at "
-         "start\" starts each game as part of the collection (its gameconfig.txt), skipping the "
-         "Sony, Naughty Dog and Bluepoint logos.");
-    Hint("Free camera: hold Cross and press L3 (keyboard: Space + Z). "
-         "Debug menu: left touchpad / Tab. Needs DbgFont14h.ccm and DbgFont14h.tpf "
-         "in dvdroot_ps4/font from Nexus mod #253. Right touchpad: Backspace.");
-
+         "stays at 1080p, noticeably slower on the Steam Deck and older GPUs. "
+         "Off: everything renders at the preset's size, changes need a restart. Auto turns "
+         "it on for strong discrete GPUs. Applies after restarting the game.");
+    // No game-effect, cheat or model-detail toggles here: those were Bloodborne patches
+    // (scripts/patches.py, patches/Bloodborne.xml), which the Uncharted launch never applies.
     bool restart = s.object_motion != s.startup_object_motion ||
-                   s.model_lod != s.startup_model_lod ||
                    s.live_resolution != s.startup_live_resolution ||
                    BbSettings::ResolutionNeedsRestart();
-    for (int e = 0; e < BbSettings::EffectCount; ++e) {
-        restart |= s.effects[e] != s.startup_effects[e];
-    }
     if (restart) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                           "Changes will apply after restarting the game");
+                           "Changes apply after restarting the game");
         if (ImGui::Button("Apply and restart the game")) {
             BbSettings::Save();
             runtime_restart();
         }
     }
 
-    ImGui::SeparatorText("Miscellaneous");
+    ImGui::SeparatorText("Other");
     Checkbox("FPS counter in the corner", s.show_fps);
 
     ImGui::Spacing();
@@ -505,8 +478,203 @@ void FpsCounter() {
                 : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
                 : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
                 : s.upscaler == BbSettings::UpscalerDlss ? "DLSS"
+                : s.upscaler == BbSettings::UpscalerXess ? "XeSS"
                                                          : "");
     ImGui::End();
+}
+
+
+// ---- Trophy notices (NotifyTrophy): the console's "trophy earned" box, one at a time ----------
+struct Toast {
+    int grade = 4;
+    std::string game, name;
+    std::vector<unsigned char> png;
+};
+std::mutex toast_mutex;
+std::deque<Toast> toast_queue;       // guarded by toast_mutex
+std::atomic<bool> toast_busy{false}; // something is queued or on screen
+bool toast_on = false;
+Toast toast_now;
+std::chrono::steady_clock::time_point toast_start;
+ImTextureData* toast_icon = nullptr; // one 256x256 texture, rewritten for every notice
+ImVec2 toast_icon_uv{1.0f, 1.0f};
+constexpr float ToastSeconds = 6.0f;
+constexpr int ToastIconSize = 256;
+
+// 8-bit RGB/RGBA PNG without interlacing (what the trophy packs hold) to RGBA.
+bool DecodePng(const std::vector<unsigned char>& png, std::vector<unsigned char>& rgba, int& width,
+               int& height) {
+    static const unsigned char signature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (png.size() < 33 || std::memcmp(png.data(), signature, 8) != 0) {
+        return false;
+    }
+    const auto be32 = [](const unsigned char* p) {
+        return (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | u32(p[3]);
+    };
+    std::vector<unsigned char> idat;
+    int color_type = -1;
+    for (size_t at = 8; at + 12 <= png.size();) {
+        const u32 length = be32(&png[at]);
+        const unsigned char* type = &png[at + 4];
+        if (length > png.size() || at + 12 + length > png.size()) {
+            return false;
+        }
+        const unsigned char* body = &png[at + 8];
+        if (std::memcmp(type, "IHDR", 4) == 0 && length >= 13) {
+            width = int(be32(body));
+            height = int(be32(body + 4));
+            color_type = body[9];
+            if (body[8] != 8 || (color_type != 2 && color_type != 6) || body[12] != 0) {
+                return false;
+            }
+        } else if (std::memcmp(type, "IDAT", 4) == 0) {
+            idat.insert(idat.end(), body, body + length);
+        } else if (std::memcmp(type, "IEND", 4) == 0) {
+            break;
+        }
+        at += 12 + length;
+    }
+    if (color_type < 0 || width <= 0 || height <= 0 || width > ToastIconSize ||
+        height > ToastIconSize || idat.empty()) {
+        return false;
+    }
+    const int bpp = color_type == 6 ? 4 : 3;
+    const size_t stride = size_t(width) * bpp;
+    std::vector<unsigned char> raw((stride + 1) * height);
+    mz_ulong raw_size = mz_ulong(raw.size());
+    if (mz_uncompress(raw.data(), &raw_size, idat.data(), mz_ulong(idat.size())) != MZ_OK ||
+        raw_size != raw.size()) {
+        return false;
+    }
+    std::vector<unsigned char> pixels(stride * height);
+    for (int y = 0; y < height; ++y) {
+        const unsigned char* in = &raw[y * (stride + 1)];
+        const int filter = *in++;
+        unsigned char* row = &pixels[y * stride];
+        const unsigned char* up = y ? row - stride : nullptr;
+        for (size_t x = 0; x < stride; ++x) {
+            const int a = x >= size_t(bpp) ? row[x - bpp] : 0;
+            const int b = up ? up[x] : 0;
+            const int c = (up && x >= size_t(bpp)) ? up[x - bpp] : 0;
+            int predictor = 0;
+            switch (filter) {
+            case 0: break;
+            case 1: predictor = a; break;
+            case 2: predictor = b; break;
+            case 3: predictor = (a + b) / 2; break;
+            case 4: {
+                const int p = a + b - c, pa = std::abs(p - a), pb = std::abs(p - b),
+                          pc = std::abs(p - c);
+                predictor = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+                break;
+            }
+            default: return false;
+            }
+            row[x] = static_cast<unsigned char>(in[x] + predictor);
+        }
+    }
+    rgba.assign(size_t(width) * height * 4, 255);
+    for (size_t i = 0; i < size_t(width) * height; ++i) {
+        std::memcpy(&rgba[i * 4], &pixels[i * bpp], bpp);
+    }
+    return true;
+}
+
+// Puts the notice's icon into the shared texture (the first notice creates it).
+void SetToastIcon(const std::vector<unsigned char>& png) {
+    std::vector<unsigned char> rgba;
+    int w = 0, h = 0;
+    const bool ok = !png.empty() && DecodePng(png, rgba, w, h);
+    if (!ok && !toast_icon) {
+        return;
+    }
+    const bool created = toast_icon == nullptr;
+    if (created) {
+        toast_icon = IM_NEW(ImTextureData)();
+        toast_icon->Create(ImTextureFormat_RGBA32, ToastIconSize, ToastIconSize);
+        toast_icon->UseColors = true;
+    }
+    std::memset(toast_icon->Pixels, 0, size_t(ToastIconSize) * ToastIconSize * 4);
+    if (ok) {
+        for (int y = 0; y < h; ++y) {
+            std::memcpy(toast_icon->GetPixelsAt(0, y), &rgba[size_t(y) * w * 4], size_t(w) * 4);
+        }
+        toast_icon_uv = ImVec2(float(w) / ToastIconSize, float(h) / ToastIconSize);
+    } else {
+        toast_icon_uv = ImVec2(0.0f, 0.0f); // nothing to show: an empty square
+    }
+    if (created) {
+        ImGui::RegisterUserTexture(toast_icon);
+    } else {
+        toast_icon->UpdateRect = {0, 0, ToastIconSize, ToastIconSize};
+        toast_icon->Updates.push_back(toast_icon->UpdateRect);
+        toast_icon->Status = ImTextureStatus_WantUpdates;
+    }
+}
+
+void TrophyToast() {
+    const auto now = std::chrono::steady_clock::now();
+    if (!toast_on) {
+        std::scoped_lock lock{toast_mutex};
+        if (toast_queue.empty()) {
+            toast_busy = false;
+            return;
+        }
+        toast_now = std::move(toast_queue.front());
+        toast_queue.pop_front();
+        toast_on = true;
+        toast_start = now;
+        SetToastIcon(toast_now.png);
+        toast_now.png = {};
+    }
+    const float t = std::chrono::duration<float>(now - toast_start).count();
+    if (t >= ToastSeconds) {
+        toast_on = false;
+        return;
+    }
+    const float s = base_scale;
+    const float slide = std::min(t / 0.35f, 1.0f);
+    const float eased = 1.0f - (1.0f - slide) * (1.0f - slide);
+    const float alpha = std::min(1.0f, (ToastSeconds - t) / 0.5f);
+    static const ImVec4 colors[] = {ImVec4(0.62f, 0.82f, 0.96f, 1.0f), ImVec4(0.96f, 0.78f, 0.28f, 1.0f),
+                                    ImVec4(0.80f, 0.83f, 0.88f, 1.0f), ImVec4(0.82f, 0.52f, 0.24f, 1.0f)};
+    static const char* const names[] = {"Platinum trophy earned", "Gold trophy earned",
+                                        "Silver trophy earned", "Bronze trophy earned"};
+    const int grade = std::clamp(toast_now.grade, 1, 4) - 1;
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+               viewport->WorkPos.y + (18.0f - (1.0f - eased) * 110.0f) * s),
+        ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(340.0f * s, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f * s, 12.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f * s);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_Border, colors[grade]);
+    ImGui::Begin("##trophy_toast", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    if (toast_icon) {
+        ImGui::Image(toast_icon->GetTexRef(), ImVec2(64.0f * s, 64.0f * s), ImVec2(0.0f, 0.0f),
+                     toast_icon_uv);
+        ImGui::SameLine(0.0f, 12.0f * s);
+    }
+    ImGui::BeginGroup();
+    ImGui::TextColored(colors[grade], "%s", names[grade]);
+    ImGui::SetWindowFontScale(1.2f);
+    ImGui::TextUnformatted(toast_now.name.c_str());
+    ImGui::SetWindowFontScale(1.0f);
+    if (!toast_now.game.empty()) {
+        ImGui::TextDisabled("%s", toast_now.game.c_str());
+    }
+    ImGui::EndGroup();
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(4);
 }
 
 } // namespace
@@ -677,7 +845,16 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || text_entry_active || BbSettings::Get().show_fps);
+    return initialized &&
+           (menu_open || text_entry_active || BbSettings::Get().show_fps || toast_busy);
+}
+
+void NotifyTrophy(int grade, std::string game, std::string name, std::vector<unsigned char> png) {
+    std::scoped_lock lock{toast_mutex};
+    if (toast_queue.size() < 32) {
+        toast_queue.push_back({grade, std::move(game), std::move(name), std::move(png)});
+        toast_busy = true;
+    }
 }
 
 bool CapturesInput() {
@@ -750,6 +927,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (text_entry_active) {
         TextEntryBox();
     }
+    TrophyToast();
     ImGui::Render();
 
     const vk::RenderingAttachmentInfo attachment{

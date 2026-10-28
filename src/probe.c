@@ -6,8 +6,13 @@
 #include <string.h>
 #include <inttypes.h>
 #include <time.h>
+#include <cpuid.h>
 #include "runtime.h"
 #include "gpu/bbgpu.h"
+#ifdef _WIN32
+#include "red_zone.h"
+#endif
+#include "cpu_patch.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
 #endif
@@ -143,11 +148,72 @@ __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
 #endif
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
+/* The game is built for the PS4's AMD Jaguar CPU: AVX throughout, and BMI1 (andn, bextr, blsi, blsr,
+ * tzcnt), MOVBE, LZCNT and POPCNT in thousands of places, its libc's string functions among them.
+ * Without them it stopped at the first one with an illegal instruction (0xc000001d in libc.prx
+ * while module 0 initialized), except LZCNT, which older Intel CPUs run as BSR (other results).
+ * Exit code 24 with a message instead; BB_SKIP_CPU_CHECK=1 starts anyway. BMI1, LZCNT and MOVBE
+ * are rewritten before the game starts (cpu_patch.c) unless BB_CPU_PATCH=0. */
+static void check_cpu(void) {
+    if (getenv("BB_SKIP_CPU_CHECK")) return;
+    unsigned a=0, b=0, c=0, d=0, basic=0, leaf7=0, extended=0;
+    if (__get_cpuid(1,&a,&b,&c,&d)) basic=c;
+    if (__get_cpuid_max(0,NULL)>=7) { __cpuid_count(7,0,a,b,c,d); leaf7=b; }    if (__get_cpuid(0x80000001,&a,&b,&c,&d)) extended=c;
+    int avx=0;
+    if (((basic>>27)&1) && ((basic>>28)&1)) { /* OSXSAVE and AVX: the OS also has to save YMM state */
+        unsigned low, high;
+        __asm__ volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
+        avx=(low&6)==6;
+    }
+    const struct { int present; const char *name; } features[]={
+        {avx,"AVX"}, {(leaf7>>3)&1,"BMI1"}, {(basic>>22)&1,"MOVBE"}, {(extended>>5)&1,"LZCNT"},
+        {(basic>>23)&1,"POPCNT"}, {(basic>>20)&1,"SSE4.2"},
+    };
+    char missing[64]="";
+    const char *patch=getenv("BB_CPU_PATCH");
+    const int rewrite=!patch || strcmp(patch,"0");
+    int no_movbe=0;
+    for (size_t i=0;i<sizeof(features)/sizeof(*features);++i) {
+        if (features[i].present) continue;
+        if (rewrite && (!strcmp(features[i].name,"BMI1") || !strcmp(features[i].name,"LZCNT") ||
+                        !strcmp(features[i].name,"MOVBE"))) continue;
+#ifdef _WIN32
+        /* MOVBE alone (AMD FX): the fault handler does it (emulate_movbe). */
+        if (!strcmp(features[i].name,"MOVBE")) { no_movbe=1; continue; }
+#endif
+        if (*missing) strcat(missing,", ");
+        strcat(missing,features[i].name);
+    }
+    if (!*missing) {
+        if (no_movbe) printf("CPU: no MOVBE, the game's MOVBE instructions are emulated (slower)\n");
+        return;
+    }
+    unsigned words[12]={0};
+    char brand[49]="";
+    if (__get_cpuid_max(0x80000000,NULL)>=0x80000004)
+        for (unsigned i=0;i<3;++i) __get_cpuid(0x80000002+i,&words[i*4],&words[i*4+1],&words[i*4+2],&words[i*4+3]);
+    memcpy(brand,words,48);
+    for (size_t n=strlen(brand); n && brand[n-1]==' '; --n) brand[n-1]=0;
+    const char *name=brand;
+    while (*name==' ') ++name;
+    if (!*name) name="unknown processor";
+    fprintf(stderr,"STOP: unsupported CPU %s: missing %s (needs Intel Core 4th generation or newer, or AMD Ryzen)\n",name,missing);
+#ifdef _WIN32
+    char text[512];
+    snprintf(text,sizeof(text),"This processor cannot run the game:\n%s\n\nMissing instructions: %s\n\n"
+             "The game uses instructions of the PS4's processor. They need an Intel Core of the 4th "
+             "generation (Haswell, 2013) or newer, or an AMD Ryzen.",name,missing);
+    MessageBoxA(NULL,text,"Uncharted",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
+#endif
+    exit(24);
+}
 #ifdef _WIN32
 static void describe_address(char *out, size_t size, uintptr_t address) {
     HMODULE module=NULL;
     char name[MAX_PATH]="?";
     if (image && address-(uintptr_t)image<0x20000000) { snprintf(out,size,"guest offset 0x%" PRIxPTR,address-(uintptr_t)image); return; }
+    uint64_t site;
+    if (red_zone_site(address,&site)) { snprintf(out,size,"red-zone thunk for guest offset %#" PRIx64,site); return; }
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)address,&module) && module) {
         GetModuleFileNameA(module,name,sizeof(name));
         const char *base=strrchr(name,'\\');
@@ -186,12 +252,87 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
 }
+/* AMD FX (Piledriver) has everything the PS4's code needs except MOVBE (byte-swapped loads and
+ * stores, a few hundred places in each game). There it raises an illegal instruction: the load
+ * or store is done here and the guest goes on after it (issue #251). Register operand forms do
+ * not exist; segment and address-size prefixes are left to the fault report. */
+static volatile LONG64 movbe_emulated;
+/* Decodes a MOVBE with a memory operand at p (regs: Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi,
+ * R8-R15, as in CONTEXT): its length, or 0 when it is not one. */
+static int movbe_decode(const unsigned char *p, const uint64_t *regs, uint64_t rip, uint64_t *address,
+                        int *reg, int *width, int *store) {
+    int n=0, size16=0, rex=0;
+    while (n<3 && p[n]==0x66) { size16=1; ++n; }
+    if ((p[n]&0xf0)==0x40) rex=p[n++];
+    if (p[n]!=0x0f || p[n+1]!=0x38 || (p[n+2]!=0xf0 && p[n+2]!=0xf1)) return 0;
+    *store=p[n+2]==0xf1;
+    n+=3;
+    const unsigned char modrm=p[n++];
+    const int mod=modrm>>6, rm=modrm&7;
+    *reg=((modrm>>3)&7)|((rex&4)<<1);
+    if (mod==3) return 0;
+    uint64_t at=0;
+    int rip_relative=0;
+    if (rm==4) {
+        const unsigned char sib=p[n++];
+        const int index=((sib>>3)&7)|((rex&2)<<2), base=(sib&7)|((rex&1)<<3);
+        if (index!=4) at+=regs[index]<<(sib>>6);
+        if ((sib&7)==5 && mod==0) { int32_t d; memcpy(&d,p+n,4); n+=4; at+=(uint64_t)(int64_t)d; }
+        else at+=regs[base];
+    } else if (rm==5 && mod==0) {
+        int32_t d; memcpy(&d,p+n,4); n+=4; at=(uint64_t)(int64_t)d; rip_relative=1;
+    } else {
+        at=regs[rm|((rex&1)<<3)];
+    }
+    if (mod==1) { at+=(uint64_t)(int64_t)(int8_t)p[n]; n+=1; }
+    else if (mod==2) { int32_t d; memcpy(&d,p+n,4); n+=4; at+=(uint64_t)(int64_t)d; }
+    if (rip_relative) at+=rip+(uint64_t)n;
+    *address=at;
+    *width=(rex&8) ? 8 : size16 ? 2 : 4;
+    return n;
+}
+static int emulate_movbe(CONTEXT *c) {
+    DWORD64 *regs=&c->Rax;
+    uint64_t address;
+    int reg, width, store;
+    const int n=movbe_decode((const unsigned char *)(uintptr_t)c->Rip,(const uint64_t *)regs,c->Rip,
+                             &address,&reg,&width,&store);
+    if (!n) return 0;
+    void *memory=(void *)(uintptr_t)address;
+    if (store) {
+        const uint64_t v=regs[reg];
+        if (width==8) { uint64_t s=__builtin_bswap64(v); memcpy(memory,&s,8); }
+        else if (width==4) { uint32_t s=__builtin_bswap32((uint32_t)v); memcpy(memory,&s,4); }
+        else { uint16_t s=__builtin_bswap16((uint16_t)v); memcpy(memory,&s,2); }
+    } else if (width==8) {
+        uint64_t v; memcpy(&v,memory,8); regs[reg]=__builtin_bswap64(v);
+    } else if (width==4) {
+        uint32_t v; memcpy(&v,memory,4); regs[reg]=__builtin_bswap32(v);
+    } else {
+        uint16_t v; memcpy(&v,memory,2); regs[reg]=(regs[reg]&~(DWORD64)0xffff)|__builtin_bswap16(v);
+    }
+    c->Rip+=(DWORD64)n;
+    InterlockedIncrement64(&movbe_emulated);
+    return 1;
+}
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    /* Instructions this CPU lacks (cpu_patch.c): a rewritten breakpoint (Rip at the int3) or one
+     * the scan missed continue in a thunk. */
+    if (code==EXCEPTION_BREAKPOINT || code==EXCEPTION_ILLEGAL_INSTRUCTION) {
+        uint64_t rip=info->ContextRecord->Rip;
+        if (code==EXCEPTION_BREAKPOINT ? cpu_patch_breakpoint(&rip,rip) : cpu_patch_illegal(&rip)) {
+            info->ContextRecord->Rip=rip;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
-        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) {
+            red_zone_fault_handled(info->ContextRecord->Rip);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if (runtime_fault_recover) {
             /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
              * in bb_longjmp, outside the exception dispatcher, back at its recovery point. */
@@ -205,6 +346,9 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
+    if (code==EXCEPTION_ILLEGAL_INSTRUCTION && image &&
+        (uintptr_t)info->ContextRecord->Rip-(uintptr_t)image<0x20000000 &&
+        emulate_movbe(info->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
     if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_ILLEGAL_INSTRUCTION || code==EXCEPTION_PRIV_INSTRUCTION ||
         code==EXCEPTION_STACK_OVERFLOW || code==EXCEPTION_INT_DIVIDE_BY_ZERO || code==EXCEPTION_DATATYPE_MISALIGNMENT) {
         /* Faults in guest code, the loader or the runtime end the process with a report; drivers
@@ -239,6 +383,13 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 #endif
 #ifndef _WIN32
 static void fault(int sig, siginfo_t *info, void *context) {
+    /* Instructions this CPU lacks (cpu_patch.c): a rewritten breakpoint (rip after the int3) or
+     * one the scan missed continue in a thunk. */
+    if (sig == SIGTRAP || sig == SIGILL) {
+        greg_t *rip = &((ucontext_t *)context)->uc_mcontext.gregs[REG_RIP];
+        uint64_t to = (uint64_t)*rip;
+        if (sig == SIGTRAP ? cpu_patch_breakpoint(&to, to - 1) : cpu_patch_illegal(&to)) { *rip = (greg_t)to; return; }
+    }
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
@@ -563,36 +714,106 @@ static unsigned char *near_image_memory(size_t size) {
                                 size,MEM_RESERVE|MEM_COMMIT,PAGE_EXECUTE_READWRITE);
     }
 #else
-    (void)size;
+    /* bbport (Linux): the same search with mmap (MAP_FIXED_NOREPLACE never moves existing mappings).
+     * Without this every game callback was skipped on Linux: the mouse camera hooks and the U2
+     * camera focus NaN reset, among the plain patches that follow the thunks. */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+    uint64_t end_of_image=round_page(guest_image_size ? guest_image_size : 1);
+    uint64_t base=((uint64_t)(uintptr_t)image+end_of_image+(32u<<20)+0xffff)&~(uint64_t)0xffff;
+    for (uint64_t step=0;!memory && step<(1900ull<<20);step+=1u<<16) {
+        uint64_t candidates[2]={base+step,0};
+        if ((uint64_t)(uintptr_t)image>step+(2u<<20))
+            candidates[1]=((uint64_t)(uintptr_t)image-step-(2u<<20))&~(uint64_t)0xffff;
+        for (int i=0;i<2 && !memory;++i) {
+            if (!candidates[i]) continue;
+            void *p=mmap((void *)(uintptr_t)candidates[i],size,PROT_READ|PROT_WRITE|PROT_EXEC,
+                         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+            if (p==(void *)(uintptr_t)candidates[i]) memory=p;
+            else if (p!=MAP_FAILED) munmap(p,size); /* an old kernel ignoring the flag */
+        }
+    }
 #endif
     return memory;
+}
+/* Finds `pattern` (hex bytes, "??" = any byte) in the executable segments: returns the number of
+ * matches and the first one (an image offset) in *found; the pattern length goes to *length. */
+static size_t find_pattern(Segment *segments, uint64_t ns, const char *pattern, uint64_t *found, size_t *length) {
+    unsigned char bytes[256], mask[256];
+    size_t n=0, matches=0, first=0;
+    for (const char *p=pattern;*p;) {
+        if (*p==' ') { ++p; continue; }
+        if (n==sizeof(bytes) || !p[1]) return 0;
+        if (p[0]=='?' && p[1]=='?') { bytes[n]=0; mask[n++]=0; p+=2; continue; }
+        char pair[3]={p[0],p[1],0}, *end;
+        bytes[n]=(unsigned char)strtol(pair,&end,16);
+        if (*end) return 0;
+        mask[n++]=1; p+=2;
+    }
+    *length=n;
+    while (first<n && !mask[first]) ++first;
+    if (first==n) return 0;
+    for (uint64_t s=0;s<ns;++s) {
+        if (!(segments[s].flags&1) || segments[s].size<n) continue;
+        const unsigned char *code=image+segments[s].address;
+        for (uint64_t i=0;i+n<=segments[s].size;++i) {
+            if (code[i+first]!=bytes[first]) continue;
+            size_t k=0;
+            while (k<n && (!mask[k] || code[i+k]==bytes[k])) ++k;
+            if (k==n && !matches++) *found=segments[s].address+i;
+        }
+    }
+    return matches;
 }
 static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t image_size) {
     size_t count=0;
     const RuntimeGuestCallback *callbacks=runtime_guest_callbacks(&count);
     unsigned char *thunks=NULL;
+    int thunk_failed=0;
     size_t used=0;
+    uint8_t installed[32]={0};
+    uint64_t hook_offsets[32]; size_t hooks_done=0;
     guest_image_size=image_size;
+    if (count>sizeof(installed)) count=sizeof(installed);
+    /* A/B tests: BB_CALLBACKS=0 installs none, BB_CALLBACKS_SKIP=<text> none whose name contains the text */
+    const char *off=getenv("BB_CALLBACKS"), *skip=getenv("BB_CALLBACKS_SKIP");
+    if (off && off[0]=='0') { printf("Callbacks: disabled (BB_CALLBACKS=0)\n"); return; }
     for (size_t i=0;i<count;++i) {
         const RuntimeGuestCallback *c=&callbacks[i];
-        if (!mapped(segments,ns,c->offset,c->signature_size) ||
-            memcmp(image+c->offset,c->signature,c->signature_size)) continue;
+        if (skip && *skip && strstr(c->name,skip)) continue;
+        uint64_t found=0;
+        size_t length=0, matches=find_pattern(segments,ns,c->pattern,&found,&length);
+        if (matches>1) { printf("Callbacks: %s: %zu matches, not installed\n",c->name,matches); continue; }
+        if (!matches) continue;
+        const uint64_t offset=found+c->skip;
+        int hooked=0;
+        for (size_t j=0;j<hooks_done;++j) if (hook_offsets[j]==offset) hooked=1;
+        if (hooked) continue;                                          /* an earlier entry took this site */
+        if (hooks_done<sizeof(hook_offsets)/sizeof(*hook_offsets)) hook_offsets[hooks_done++]=offset;
         if (!c->callback) {
-            memcpy(image+c->offset,c->patch,c->moved);
-            printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,c->offset);
+            memcpy(image+offset,c->patch,c->moved);
+            installed[i]=1;
+            printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,offset);
             continue;
         }
-        if (!thunks && !(thunks=near_image_memory(4096))) { printf("Callbacks: no thunk memory\n"); return; }
-        if (used+256>4096) break;
-        unsigned char *t=thunks+used, *f=image+c->offset;
+        if (!thunks && !thunk_failed && !(thunks=near_image_memory(8192))) {
+            printf("Callbacks: no thunk memory\n");
+            thunk_failed=1; /* the plain patches below still apply */
+        }
+        if (!thunks) continue;
+        if (used+320>8192) break;
+        unsigned char *t=thunks+used, *f=image+offset;
         size_t k=0;
-        /* pushfq; push rax rcx rdx r8-r11 rbx; mov rbx, rsp; and rsp, -16; sub rsp, 0xa0 (works at
-         * a function's start and inside it) */
+        /* pushfq; push rax rcx rdx r8-r11 rbx r12 r13 r15 (the RuntimeGuestRegs block); mov rbx, rsp;
+         * and rsp, -16; sub rsp, 0xb0 (shadow space, the fifth argument, 8 xmm saves): works at a
+         * function's start and inside it */
         static const unsigned char save[]={0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x53,
-                                           0x48,0x89,0xe3,0x48,0x83,0xe4,0xf0,0x48,0x81,0xec,0xa0,0x00,0x00,0x00};
+                                           0x41,0x54,0x41,0x55,0x41,0x57,
+                                           0x48,0x89,0xe3,0x48,0x83,0xe4,0xf0,0x48,0x81,0xec,0xb0,0x00,0x00,0x00};
         memcpy(t+k,save,sizeof(save)); k+=sizeof(save);
-        for (int x=0;x<8;++x) {                                     /* movdqu [rsp+0x20+16x], xmmx */
-            const uint32_t disp=0x20u+16u*(uint32_t)x;
+        for (int x=0;x<8;++x) {                                     /* movdqu [rsp+0x30+16x], xmmx */
+            const uint32_t disp=0x30u+16u*(uint32_t)x;
             t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x7f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;
             memcpy(t+k,&disp,4); k+=4;
         }
@@ -601,16 +822,17 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         const uintptr_t base=(uintptr_t)image, host=(uintptr_t)c->callback;
         t[k++]=0x49; t[k++]=0xb8; memcpy(t+k,&base,8); k+=8;        /* movabs r8, image */
         t[k++]=0x4d; t[k++]=0x89; t[k++]=0xf1;                      /* mov r9, r14 */
+        t[k++]=0x48; t[k++]=0x89; t[k++]=0x5c; t[k++]=0x24; t[k++]=0x20; /* mov [rsp+0x20], rbx (regs) */
         t[k++]=0x48; t[k++]=0xb8; memcpy(t+k,&host,8); k+=8;        /* movabs rax, callback */
         t[k++]=0xff; t[k++]=0xd0;                                   /* call rax */
-        for (int x=0;x<8;++x) {                                     /* movdqu xmmx, [rsp+0x20+16x] */
-            const uint32_t disp=0x20u+16u*(uint32_t)x;
+        for (int x=0;x<8;++x) {                                     /* movdqu xmmx, [rsp+0x30+16x] */
+            const uint32_t disp=0x30u+16u*(uint32_t)x;
             t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x6f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;
             memcpy(t+k,&disp,4); k+=4;
         }
-        /* mov rsp, rbx; pop rbx r11-r8 rdx rcx rax; popfq */
-        static const unsigned char restore[]={0x48,0x89,0xdc,0x5b,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,
-                                              0x5a,0x59,0x58,0x9d};
+        /* mov rsp, rbx; pop r15 r13 r12 rbx r11-r8 rdx rcx rax; popfq */
+        static const unsigned char restore[]={0x48,0x89,0xdc,0x41,0x5f,0x41,0x5d,0x41,0x5c,0x5b,
+                                              0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5a,0x59,0x58,0x9d};
         memcpy(t+k,restore,sizeof(restore)); k+=sizeof(restore);
         memcpy(t+k,f,c->moved); k+=c->moved;                       /* the moved instructions */
         int32_t back=(int32_t)((int64_t)(uintptr_t)(f+c->moved)-(int64_t)(uintptr_t)(t+k+5));
@@ -618,7 +840,162 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         int32_t to=(int32_t)((int64_t)(uintptr_t)t-(int64_t)(uintptr_t)(f+5));
         f[0]=0xe9; memcpy(f+1,&to,4); memset(f+5,0x90,c->moved-5);
         used+=(k+15)&~(size_t)15;
-        printf("Callbacks: %s at %#" PRIx64 "\n",c->name,c->offset);
+        installed[i]=1;
+        printf("Callbacks: %s at %#" PRIx64 "\n",c->name,offset);
+    }
+    /* Names start with the game ("U2 ..."): a callback missing from a game whose other callbacks
+     * attached is reported; callbacks of the other games are not. */
+    int any=0;
+    for (size_t i=0;i<count;++i) {
+        int seen=0, ok=0, group=0;
+        const size_t game=strcspn(callbacks[i].name," ");
+        for (size_t j=0;j<count;++j) {
+            if (!strcmp(callbacks[j].name,callbacks[i].name)) { if (j<i) seen=1; if (installed[j]) ok=1; }
+            if (installed[j] && !strncmp(callbacks[j].name,callbacks[i].name,game+1)) group=1;
+        }
+        any|=ok;
+        if (!seen && !ok && group) printf("Callbacks: %s not found\n",callbacks[i].name);
+    }
+    if (!any) printf("Callbacks: none of the known camera and pad code was found (unknown build?)\n");
+}
+/* Naughty Dog's FrameBegin (ndlib/render/fg-draw-mgr.cpp) asserts that the frame it recycles,
+ * three back, has its GPU end-of-pipe tick (set by the game's EOP interrupt handler). It never
+ * waits: on PS4 the GPU always keeps up. Here the GPU side can fall behind (shaders building on a
+ * first run, an upscaler starting) and the game stopped right after U1's first cutscene. The
+ * assertion's branch is found through its message, in any version of the three games, and the
+ * failed check now waits (pause, check again) instead. */
+static void patch_eop_tick_wait(uint64_t image_size) {
+    static const char message[]="GetRenderFrameParams(frameToFreeInstancesFor)->m_gfxEopTick";
+    unsigned char *text=NULL;
+    for (uint64_t i=0;i+sizeof(message)<=image_size;++i)
+        if (image[i]=='G' && !memcmp(image+i,message,sizeof(message))) { text=image+i; break; }
+    if (!text) return;
+    int patched=0;
+    for (uint64_t at=0;at+7<=image_size;++at) {
+        /* lea reg, [rip+rel32] -> the message (REX.W, any register) */
+        if ((image[at]&0xfb)!=0x48 || image[at+1]!=0x8d || (image[at+2]&0xc7)!=0x05) continue;
+        int32_t rel; memcpy(&rel,image+at+3,4);
+        if (image+at+7+rel!=text) continue;
+        /* The assertion path ends in the int 0x41 shortly after the message is loaded. */
+        unsigned char *trap=NULL;
+        for (unsigned char *q=image+at+7;q<image+at+0x80 && q+2<=image+image_size;++q)
+            if (q[0]==0xcd && q[1]==0x41) { trap=q; break; }
+        if (!trap) continue;
+        /* Up to 0x100 bytes before the trap: cmp qword [base(+index*scale)+disp8/32], 0 (REX.W 83 /7,
+         * mod 01/10, with or without SIB: 1.00 has [rax+0xa08], US 1.02 [rax+rcx+0xa08]), then a short or
+         * near jne past the trap (the assertion is the fall-through) or je to the assertion. The assertion
+         * path is dead code ending in the trap; its first 7 bytes become pause; jmp back to the cmp. */
+        for (unsigned char *c=trap-2;c>image && trap-c<=0x100;--c) {
+            if ((c[0]&0xf8)!=0x48 || c[1]!=0x83 || ((c[2]>>3)&7)!=7) continue;
+            const int mod=c[2]>>6, sib=(c[2]&7)==4;
+            if (mod!=1 && mod!=2) continue;
+            const int length=3+sib+(mod==2 ? 4 : 1);
+            if (c[length]!=0x00) continue;
+            unsigned char *j=c+length+1, *target, *after;
+            int jne;
+            if (j[0]==0x75 || j[0]==0x74) { target=j+2+(int8_t)j[1]; after=j+2; jne=j[0]==0x75; }
+            else if (j[0]==0x0f && (j[1]==0x85 || j[1]==0x84)) {
+                int32_t d; memcpy(&d,j+2,4); target=j+6+d; after=j+6; jne=j[1]==0x85;
+            } else continue;
+            unsigned char *path=jne ? after : target;
+            if (jne ? target<=trap : target<=c) continue;
+            if (path<c || path+7>trap+2) continue;
+            const int32_t back=(int32_t)(c-(path+7));
+            path[0]=0xf3; path[1]=0x90; path[2]=0xe9; memcpy(path+3,&back,4);
+            printf("Frame pacing: the EOP tick check at %#" PRIx64 " waits for the GPU\n",(uint64_t)(c-image));
+            ++patched;
+            break;
+        }
+    }
+    if (!patched) printf("Frame pacing: EOP tick check not found\n");
+}
+/* The single offset in the image where a byte pattern ("4d8d7001 74??", ?? = any byte) occurs,
+ * else -1 (none or several). */
+static int64_t find_unique_pattern(uint64_t image_size, const char *pattern) {
+    unsigned char bytes[64], mask[64];
+    size_t n=0;
+    for (const char *p=pattern;*p && n<sizeof(bytes);) {
+        if (*p==' ') { ++p; continue; }
+        mask[n]=p[0]!='?';
+        bytes[n]=mask[n] ? (unsigned char)strtoul((char[]){p[0],p[1],0},NULL,16) : 0;
+        ++n;
+        p+=2;
+    }
+    int64_t found=-1;
+    for (uint64_t at=0;at+n<=image_size;++at) {
+        if (image[at]!=bytes[0]) continue;
+        size_t i=1;
+        while (i<n && (!mask[i] || image[at+i]==bytes[i])) ++i;
+        if (i<n) continue;
+        if (found>=0) return -1;
+        found=(int64_t)at;
+    }
+    return found;
+}
+/* Naughty Dog's job manager (all three games): the six NdJobWorkerThreads spin on their queues
+ * with `pause` unless the manager's sleep flag (byte +0x59, set by its own SetSleepMode) is on.
+ * With it on, an idle worker waits on the manager's condition variable after 1000 spins (10 ms
+ * timeout) and every job submission wakes them. On the PS4 each worker owns a core and the flag
+ * stays off; on a 4-core CPU (Steam Deck) the spinning workers starve the GPU command thread.
+ * The flag is treated as on in the worker loop, in its re-check before waiting and in the submit
+ * path: all three or none. Found by BilalReloaded
+ * (github.com/bc160201983/Uncharted-The-Nathan-Drake-Collection-PC-port, JOB_SLEEP_PATCHES in
+ * tools/probe_uncharted.py) on 01.09. The retail 01.02 (the EU dump) has the same three sites:
+ * its worker loop is identical, but its re-check loads the manager through r13 (not r15) and its
+ * submit path tests rdi and jumps with a short je. A build that matches no set keeps spinning.
+ * BB_JOB_SLEEP=0 keeps the spinning workers. */
+static void patch_job_sleep(uint64_t image_size) {
+    const char *env=getenv("BB_JOB_SLEEP");
+    if (env && env[0]=='0') { printf("Job workers: spin while idle (BB_JOB_SLEEP=0)\n"); return; }
+#ifdef _WIN32
+    /* Sleeping workers free the cores of small CPUs, but cost ~8% in busy scenes on a 16-thread
+     * one (U3 Cartagena square: 87 vs 94 FPS). By default only up to 8 hardware threads;
+     * BB_JOB_SLEEP=1 forces it. */
+    const DWORD threads=GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (!env && threads>8) { printf("Job workers: spin while idle (%lu hardware threads)\n",(unsigned long)threads); return; }
+#endif
+    struct Patch {
+        const char *name, *pattern;
+        unsigned offset, original_size, size;
+        unsigned char original[2], replacement[6];
+    };
+    static const struct Patch builds[][3]={
+        {
+            /* je past the sleep -> nop nop */
+            {"worker loop","4d8d7001 807f5900 74?? 4981f8e8030000 7c??",8,1,2,{0x74},{0x90,0x90}},
+            {"re-check before waiting","498b07 80785900 74?? 4889c7 4883ef80",7,1,2,{0x74},{0x90,0x90}},
+            /* je rel32 past the wake-up -> 6-byte nop */
+            {"job submission wakes them","80785900 0f84????0000 4883c060",4,2,6,{0x0f,0x84},
+             {0x66,0x0f,0x1f,0x44,0x00,0x00}},
+        },
+        {
+            /* 01.02: same sites, r13 in the re-check and a short je through rdi in the submit */
+            {"worker loop","4d8d7001 807f5900 74?? 4981f8e8030000 7c??",8,1,2,{0x74},{0x90,0x90}},
+            {"re-check before waiting","498b4500 80785900 74?? 4889c7 4883ef80",8,1,2,{0x74},{0x90,0x90}},
+            {"job submission wakes them","807f5900 74?? 4883c760 beffffffff",4,1,2,{0x74},{0x90,0x90}},
+        },
+    };
+    const size_t nbuilds=sizeof(builds)/sizeof(builds[0]);
+    for (size_t b=0;b<nbuilds;++b) {
+        int64_t at[3];
+        size_t i;
+        for (i=0;i<3;++i) {
+            at[i]=find_unique_pattern(image_size,builds[b][i].pattern);
+            if (at[i]<0 || memcmp(image+at[i]+builds[b][i].offset,builds[b][i].original,
+                                  builds[b][i].original_size))
+                break;
+        }
+        if (i<3) {
+            if (b+1<nbuilds) continue;
+            printf("Job workers: %s not found, idle workers keep spinning\n",builds[b][i].name);
+            return;
+        }
+        for (i=0;i<3;++i) {
+            memcpy(image+at[i]+builds[b][i].offset,builds[b][i].replacement,builds[b][i].size);
+            printf("Job workers: %s at %#" PRIx64 " (idle workers sleep)\n",builds[b][i].name,
+                   (uint64_t)at[i]+builds[b][i].offset);
+        }
+        return;
     }
 }
 /* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
@@ -665,6 +1042,10 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
+    if (argc == 2 && !strcmp(argv[1], "--controller-info")) return runtime_pad_tool(0,100);
+    if (argc == 3 && !strcmp(argv[1], "--controller-test"))
+        return runtime_pad_tool(1,atoi(argv[2]));
+    check_cpu();
 #ifdef _WIN32
     /* The PS4 user range must stay free of host allocations (GPU driver, heaps), and the guest
      * TCB needs one of the 64 TEB TLS slots before DLLs (Vulkan drivers) take them. */
@@ -673,7 +1054,7 @@ int main(int argc, char **argv) {
 #endif
     int cpu_only = 0, strict_imports = 0, list_missing = 0;
     unsigned timeout_seconds = 10;
-    const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *guest_argv_file=NULL;
+    const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *guest_argv_file=NULL, *trophy_dir=NULL;
     for (int i = 2; i < argc; ++i) {
         if (!strcmp(argv[i], "--cpu-only")) cpu_only = 1;
         else if (!strcmp(argv[i], "--strict-imports")) strict_imports = 1;
@@ -683,11 +1064,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--user") && i+1<argc) user_dir=argv[++i];
         else if (!strcmp(argv[i], "--patches") && i+1<argc) patch_file=argv[++i];
         else if (!strcmp(argv[i], "--guest-argv") && i+1<argc) guest_argv_file=argv[++i];
+        else if (!strcmp(argv[i], "--trophies") && i+1<argc) trophy_dir=argv[++i];
         else if (!strcmp(argv[i], "--timeout") && i+1<argc) timeout_seconds=(unsigned)strtoul(argv[++i],NULL,10);
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--list-missing] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--guest-argv file] [--timeout seconds] | --vulkan-only\n", argv[0]);
+        fprintf(stderr, "Usage: %s boot.bin [options] | --vulkan-only | --controller-info | --controller-test 0..100\n", argv[0]);
         return 1;
     }
     if (content_profile) {
@@ -715,6 +1097,7 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"APP_VER",version,sizeof(version),NULL);
         bbnet_configure(app0,serial,title,version);
     }
+    if (trophy_dir) runtime_trophy_configure(trophy_dir);
     bbgpu_register_kernel();
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
@@ -732,7 +1115,7 @@ int main(int argc, char **argv) {
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGTRAP, &sa, NULL);
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
@@ -905,10 +1288,28 @@ int main(int argc, char **argv) {
         uint64_t image_end=0;
         for (uint64_t s=0;s<ns;++s) if (segments[s].address+segments[s].size>image_end) image_end=segments[s].address+segments[s].size;
         install_game_callbacks(segments, ns, image_end);
+        patch_eop_tick_wait(image_end);
+        patch_job_sleep(image_end);
+        runtime_display_patch(image, image_end);
     }
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
+    /* Last code patch: Windows exception frames and the red zone of leaf functions (red_zone.c). */
+    {
+        RedZoneSegment *loaded=calloc(ns ? ns : 1,sizeof(*loaded));
+        if (!loaded) fail("allocation failed");
+        for (uint64_t s=0;s<ns;++s) loaded[s]=(RedZoneSegment){segments[s].address,segments[s].size,segments[s].flags};
+        red_zone_patch(image, size, loaded, ns);
+        free(loaded);
+    }
 #endif
+    {
+        uint64_t code[64][2];
+        size_t n=0;
+        for (uint64_t s=0;s<ns;++s)
+            if (segments[s].flags&1) { code[n][0]=segments[s].address; code[n][1]=segments[s].size; ++n; }
+        cpu_patch_image(image, size, (const uint64_t (*)[2])code, n);
+    }
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;
@@ -948,7 +1349,10 @@ int main(int argc, char **argv) {
     if (getenv("BB_WATCH")) CloseHandle(CreateThread(NULL,0,watch_thread,getenv("BB_WATCH"),0,NULL));
 #endif
     /* argv: the executable and, after sceSystemServiceLoadExec, the arguments it was given
-     * (--guest-argv: one per line, the guest path first). */
+     * (--guest-argv: one per line, the guest path first). The caller's list is argv as is, its
+     * first element argv[0] (execve): the collection menu passes "eboot.bin"
+     * "ispartofuccollection", and U2 took an "eboot.bin" in argv[1] for an option and stayed
+     * on a grey screen. The path is argv[0] only when no arguments were given. */
     struct { uint64_t argc; const char *argv[34]; } params = {1, {"/app0/eboot.bin", NULL}};
     if (guest_argv_file) {
         FILE *list=fopen(guest_argv_file,"rb");
@@ -959,7 +1363,10 @@ int main(int argc, char **argv) {
             params.argv[n]=lines[n]; ++n;
         }
         if (list) fclose(list);
-        if (n) { params.argc=n; params.argv[n]=NULL; }
+        if (n>1) {
+            for (uint64_t i=1;i<n;++i) params.argv[i-1]=lines[i];
+            params.argc=n-1; params.argv[n-1]=NULL;
+        } else if (n) { params.argc=1; params.argv[1]=NULL; }
         printf("Guest argv: %s (+%" PRIu64 " arguments)\n",params.argv[0],params.argc-1);
     }
 #ifdef _WIN32
