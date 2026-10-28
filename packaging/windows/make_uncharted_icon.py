@@ -1,6 +1,7 @@
 """Draws the launcher icon (a brass compass rose on an old map) as .ico and .png. Original
 artwork, no game logos. Needs Pillow.
-usage: make_uncharted_icon.py launcher/uncharted.ico launcher/uncharted.png"""
+usage: make_uncharted_icon.py launcher/uncharted.ico launcher/uncharted.png [full.png]
+The optional third path gets the untouched 1024x1024 render (AppImage icons)."""
 import math
 import sys
 from PIL import Image, ImageDraw, ImageFilter
@@ -67,3 +68,5 @@ big = draw()
 big.resize((256, 256), Image.LANCZOS).save(
     sys.argv[1], sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 big.resize((128, 128), Image.LANCZOS).save(sys.argv[2])
+if len(sys.argv) > 3:  # optional full-resolution render (AppImage icons at 512/1024)
+    big.save(sys.argv[3])

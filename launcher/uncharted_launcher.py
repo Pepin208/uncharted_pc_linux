@@ -280,6 +280,23 @@ def game_info(folder):
     return info
 
 
+def sibling_game_dir():
+    """The collection next to the launcher, when the package found it (AppRun sets BB_GAME_DIR on
+    Linux to the sibling folder holding eboot.bin). Empty when there is none or it is not a game
+    folder. Used so a new user does not have to browse before pressing PLAY."""
+    folder = os.environ.get('BB_GAME_DIR', '')
+    return folder if folder and (Path(folder) / 'eboot.bin').is_file() else ''
+
+
+def load_settings():
+    """settings.json over the defaults. A package's sibling game folder fills an empty game_dir,
+    so a user who unzipped the game next to the AppImage just presses PLAY."""
+    settings = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
+    if not settings.get('game_dir'):
+        settings['game_dir'] = sibling_game_dir()
+    return settings
+
+
 def display_refresh_rate():
     """Refresh rate of the main display in Hz, or None."""
     try:
@@ -390,7 +407,7 @@ class Launcher:
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
         self.root = root
-        self.app = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
+        self.app = load_settings()
         # skip_intro is shared with the in-game menu through bbport.ini: it wins over settings.json.
         ini_skip_intro = get_ini('skip_intro')
         if ini_skip_intro is not None:
@@ -633,7 +650,10 @@ class Launcher:
         self.ttk.Entry(holder, textvariable=var, width=54).pack(side='left')
 
         def browse():
-            chosen = self.filedialog.askdirectory(title=prompt, initialdir=var.get() or str(PORT_DIR))
+            # Never open at the read-only AppImage mount (PORT_DIR): the sibling game folder for
+            # the game field, the data folder for the rest.
+            start = var.get() or (sibling_game_dir() if key == 'game_dir' else '') or str(DATA_DIR)
+            chosen = self.filedialog.askdirectory(title=prompt, initialdir=start)
             if chosen:
                 var.set(str(Path(chosen)))
         self.pill(holder, _('Browse…'), browse, padding=(14, 6)).pack(side='left', padx=(8, 0))
@@ -1726,7 +1746,7 @@ def main():
         sys.exit(install_update(args[1], args[2]))
     if FROZEN and UPDATE_DIR not in PORT_DIR.parents:
         shutil.rmtree(UPDATE_DIR, ignore_errors=True)  # what a finished update left behind
-    settings = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
+    settings = load_settings()
     if '--play' in args and (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file():
         sys.exit(play_without_window(settings))
     try:

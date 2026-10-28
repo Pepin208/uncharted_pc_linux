@@ -41,9 +41,20 @@ echo "  game  $game"
 echo "  log   $log"
 
 # --- interpreter and game folder -----------------------------------------------------------
-if [[ -z ${PYTHON:-} ]]; then PYTHON=$(command -v python3 || true); fi
-if [[ -z ${PYTHON:-} ]]; then echo "FATAL: install Python 3 or set PYTHON." >&2; exit 1; fi
+# Packaged (AppImage): the frozen launcher runs this port's scripts itself through its --script
+# role, so no system Python is needed. From a source tree, use the installed Python 3.
+launcher=${BB_LAUNCHER:-}
+if [[ -z $launcher && -x $PORT/Uncharted ]]; then launcher=$PORT/Uncharted; fi
+if [[ -z $launcher ]]; then
+    if [[ -z ${PYTHON:-} ]]; then PYTHON=$(command -v python3 || true); fi
+    if [[ -z ${PYTHON:-} ]]; then echo "FATAL: install Python 3 or set PYTHON." >&2; exit 1; fi
+fi
 export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+
+# Runs one of scripts/: with the frozen launcher when packaged, else the system interpreter.
+run_script() {
+    if [[ -n $launcher ]]; then "$launcher" --script "$@"; else "$PYTHON" "$@"; fi
+}
 
 if [[ ! -f $game/eboot.bin ]]; then
     echo "FATAL: no eboot.bin in '$game' (set BB_GAME_DIR)." >&2
@@ -135,10 +146,10 @@ while :; do
     fi
     if [[ $need == 1 ]]; then
         echo "Preparing $exe ..."
-        "$PYTHON" "$PORT/scripts/prepare.py" "$game" --out "$exe_out" --exe "$exe" || exit 1
-        "$PYTHON" "$PORT/scripts/link_modules.py" "$game" --out "$exe_out" --exe "$exe" || exit 1
+        run_script "$PORT/scripts/prepare.py" "$game" --out "$exe_out" --exe "$exe" || exit 1
+        run_script "$PORT/scripts/link_modules.py" "$game" --out "$exe_out" --exe "$exe" || exit 1
     fi
-    "$PYTHON" "$PORT/scripts/content_profile.py" "$game" --out "$exe_out" \
+    run_script "$PORT/scripts/content_profile.py" "$game" --out "$exe_out" \
         --sku "${BB_CONTENT_SKU:-full}" || exit 1
 
     args=("$exe_out/boot-linked.bin" --content-profile "$exe_out/content.bin"

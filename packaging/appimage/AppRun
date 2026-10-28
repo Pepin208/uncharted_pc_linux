@@ -1,0 +1,54 @@
+#!/bin/bash
+# AppRun for the Uncharted bbport AppImage (Linux).
+#
+# Portable layout: the user keeps the game, this .AppImage and the program's data inside one
+# folder X. The data goes next to the .AppImage (not ~/.local/share), so moving X keeps saves,
+# bbport.ini, settings.json, shader cache and logs together.
+set -euo pipefail
+
+# Steam preloads its overlay (LD_PRELOAD) into every non-Steam game; it and the host's other
+# injection variables are host libraries that must not leak into this package's environment.
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GTK_PATH GTK_MODULES GIO_EXTRA_MODULES \
+      GDK_PIXBUF_MODULEDIR PYTHONHOME PYTHONPATH 2>/dev/null || true
+
+# $APPIMAGE is the absolute path of this file (set by the type-2 runtime, also when it runs
+# extracted). $APPDIR is the temporary mount point: never store data there. Running AppRun
+# straight from an AppDir (packaging tests) leaves $APPDIR unset: fall back to its own folder.
+self=$(readlink -f "${APPIMAGE:-$0}")
+selfdir=$(dirname -- "$self")
+appdir=${APPDIR:-$(cd -- "$(dirname -- "$self")" && pwd)}
+if [ -w "$selfdir" ]; then
+    BB_DATA_DIR="$selfdir/data"
+else
+    BB_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/uncharted"
+fi
+export BB_DATA_DIR
+mkdir -p -- "$BB_DATA_DIR"
+
+# The frozen launcher (PyInstaller: Python + Tkinter + Pillow) lives next to run_uncharted.sh.
+# run_uncharted.sh runs this port's scripts through its --script role, so no system Python is
+# needed; the executable's own folder is the port folder.
+PORT="$appdir/usr/share/uncharted"
+export BB_LAUNCHER="$PORT/Uncharted"
+
+# The game folder: a sibling of this .AppImage holding eboot.bin (e.g. X/CUSA02320), unless the
+# caller already set BB_GAME_DIR.
+if [ -z "${BB_GAME_DIR:-}" ]; then
+    for d in "$selfdir"/*/; do
+        if [ -f "$d/eboot.bin" ]; then BB_GAME_DIR="${d%/}"; break; fi
+    done
+fi
+[ -n "${BB_GAME_DIR:-}" ] && export BB_GAME_DIR
+
+# Diagnostic: verify the portable paths without opening a window.
+if [ "${BB_APPIMAGE_SELFTEST:-0}" = 1 ]; then
+    echo "APPIMAGE=$self"
+    echo "APPDIR=$appdir"
+    echo "PORT=$PORT"
+    echo "BB_DATA_DIR=$BB_DATA_DIR"
+    echo "BB_GAME_DIR=${BB_GAME_DIR:-<none>}"
+    echo "BB_LAUNCHER=$BB_LAUNCHER"
+    exit 0
+fi
+
+exec "$BB_LAUNCHER" "$@"

@@ -1,5 +1,9 @@
 out/
 __pycache__/
+# AppImage build tools (runtime-x86_64, mksquashfs) fetched by packaging/build-appimage.sh
+/packaging/.cache/
+# bubblewrap rootfs (Ubuntu 22.04 base) for the container build
+/bwrap/
 user/
 *.mp4
 bbport.ini

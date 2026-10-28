@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Uncharted (bbport)
+Comment=Uncharted: The Nathan Drake Collection (PS4) on Linux
+Exec=AppRun
+Icon=uncharted
+Categories=Game;
+Terminal=false
